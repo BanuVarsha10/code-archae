@@ -68,21 +68,76 @@ two model sizes:
 - llama3.1:8b as judge: better recall (caught a real causal-claim violation
   the 3b judge missed) but still inverted polarity on hedge sentences in a
   later run, and misquoted text it claimed to be judging.
-- DECISION: replaced the LLM judge entirely with two deterministic checks
-  (see explain.py): a red-flag phrase scanner (lexical substring match
-  against known causal/evaluative phrases) and an event-type consistency
-  checker (cross-references cited hashes against the real event_type in the
-  database — this is what would have caught a real bug we found earlier,
-  where generated text mislabeled a 'deleted' event as a 'modification').
-  This was a deliberate evidence-based pivot away from LLM judgment for a
-  task that turned out to need more nuance than local models reliably give,
-  NOT a default choice.
-- KNOWN LIMITATIONS of the deterministic approach, not yet stress-tested:
-  (1) the phrase scanner will miss causal claims phrased without any listed
-  trigger word, and could false-positive on benign uses of a listed word;
-  (2) the event-type checker only catches mismatches when the explanation
-  both cites a hash AND uses a mapped keyword in the same sentence — a vague
-  explanation that avoids both trivially passes without being more accurate.
+- DECISION: replaced the LLM judge entirely with deterministic checks (see
+  cli.py) — this was an evidence-based pivot away from LLM judgment for a
+  task needing more nuance than local models reliably give, NOT a default
+  choice made for convenience.
+
+## Deterministic grounding checks (current approach, in cli.py)
+Four checks run on every freshly-generated (non-cached) explanation:
+1. **Hash citation check**: extracts 8-char hex tokens, verifies each
+   against real commit hashes. Handles malformed-but-real citations (e.g. a
+   dropped leading zero, via zero-padding) separately from genuinely
+   fabricated ones.
+2. **Issue/PR citation check**: extracts #N references, verifies each
+   against issue numbers that were ACTUALLY fetched and cached (not just
+   referenced in a commit message). Found via manual spot-check, not by any
+   automated test: the model cited "#317" as a real linked issue when #317
+   was never fetched into the issues table at all — a genuine hallucinated
+   citation that passed every other check silently. This is the most
+   important bug this project has found: it shows a "PASSED" result from
+   the other three checks is not sufficient evidence of full groundedness.
+3. **Red-flag phrase scan**: lexical substring match against known
+   causal/evaluative phrases (in response to, likely, improved, aimed to,
+   etc.), now COUNT-based with severity tiers (minor/moderate/severe), not
+   just presence/absence — a context-heavy run on Response.__init__ (101
+   events) produced ~45 repetitions of "which likely aimed to improve
+   overall accuracy," a qualitatively worse failure than occasional hedge
+   language, invisible under presence-only reporting.
+4. **Event-type consistency check**: cross-references cited hashes against
+   real event_type in the database. Fixed a real false-positive: quoted PR
+   titles (e.g. a title literally containing the word "added") were being
+   scanned as if they were the model's own claims. Fix: strip quoted spans
+   before keyword-matching, still scan full sentence for hashes.
+
+## Context length is itself a failure mode, not just a phrasing problem
+Found via evidence, not assumption: functions with very large event counts
+(100+) caused generation to degrade into repetitive templated filler
+("PR #N did X, which likely aimed to improve overall accuracy") for nearly
+every line, rather than occasional hedging. Root cause diagnosed as context
+size, not prompt wording, by testing HTTP11Connection.close (29 events, fine)
+against Response.__init__ (101 events, degenerate) with an IDENTICAL prompt.
+FIX: format_lifeline_context now caps detailed events at 15 for any function
+exceeding that, always keeping renames + first 5 + last 5, with an explicit
+context note telling the model not to speculate about omitted events. This
+measurably reduced both invented content AND hedge-language severity in the
+same run — evidence the two problems share a root cause.
+
+## A THIRD failure category, not yet caught by anything: narrative fabrication
+Distinct from a wrong citation (cites something unreal) and a wrong event-type
+label (mislabels something real) is fabricating a plausible-sounding CAUSAL
+SEQUENCE between two real, correctly-cited events that never actually
+occurred. Real example: given real events "6a4376b2: deleted" followed by
+"39b57c93: modified", the model wrote "the function was deleted, then a NEW
+function was CREATED to replace it" -- a coherent narrative connecting two
+real facts that doesn't correspond to what actually happened (39b57c93 was
+a plain modification, not a recreation). This got caught ONLY because the
+narrative happened to also produce a wrong keyword ("created") that the
+event-type checker could flag -- if the model had woven the same false
+narrative using only correctly-typed keywords, nothing would have caught it.
+STATUS: known gap, not yet fixed. Worth a dedicated check if this project
+continues: something that flags claimed causal/sequential relationships
+between events and verifies no such relationship is stated in the source
+data (similar in spirit to the red-flag scanner, but for inter-event claims
+rather than single-event claims).
+
+## Explanation caching
+explanations table (qualified_name PRIMARY KEY, explanation, generated_at)
+caches generated text to avoid re-running local inference for repeat
+queries. KNOWN GAP: not yet invalidated when function_events changes (e.g.
+after processing more commit history past the current 450) -- pipeline.py's
+existing wipe-and-rebuild step should also clear this table, but doesn't
+yet.
 
 ## Files built so far
 - explore.py, explore_ast.py — early proof-of-concept scripts (Phase 1-2)
@@ -92,6 +147,9 @@ two model sizes:
 - show_lifeline.py — prints a function's full lifeline with linked issues
 - explain.py — LLM explanation layer + grounding checks (the current state
   of Phase 5)
+- cli.py — persistent interactive CLI: ranked/searchable function listing,
+  explanation generation with caching, all four deterministic grounding
+  checks. This is the current, most complete entry point to the project.
 
 ## What's NOT built yet
 - Any CLI beyond `python explain.py <function_name>` — no way to list or
@@ -111,3 +169,5 @@ two model sizes:
   LLM judge polarity inversion) and it keeps paying off.
 - GITHUB_TOKEN and ANTHROPIC_API_KEY (if ever added) live in .env, which is
   gitignored. Never hardcode credentials.
+- When debugging a claim about real data, always query the CURRENT
+  archaeologist.db directly rather than trusting memory of a prior session.
