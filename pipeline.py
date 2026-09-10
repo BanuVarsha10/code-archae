@@ -116,12 +116,13 @@ def run_pipeline(repo_url, max_commits=450):
             for mf in commit.modified_files:
                 if not mf.filename.endswith('.py'):
                     continue
+                file_path = mf.new_path or mf.old_path
                 if mf.source_code_before and mf.source_code:
                     before, after = extract(mf.source_code_before), extract(mf.source_code)
                     for name, event_type, old_name, score in classify_events(before, after):
                         conn.execute(
                             'INSERT INTO function_events (commit_hash, file_path, qualified_name, event_type, old_qualified_name, similarity) VALUES (?, ?, ?, ?, ?, ?)',
-                            (commit.hash, mf.filename, name, event_type, old_name, score))
+                            (commit.hash, file_path, name, event_type, old_name, score))
                 elif mf.source_code and not mf.source_code_before:
                     # Whole new file (e.g. the repo's first commit, or a file
                     # re-added after history was rewritten) -- every function
@@ -130,7 +131,7 @@ def run_pipeline(repo_url, max_commits=450):
                         if body and len(body) >= 80:
                             conn.execute(
                                 'INSERT INTO function_events (commit_hash, file_path, qualified_name, event_type, old_qualified_name, similarity) VALUES (?, ?, ?, ?, ?, ?)',
-                                (commit.hash, mf.filename, name, 'added', None, None))
+                                (commit.hash, file_path, name, 'added', None, None))
                 elif mf.source_code_before and not mf.source_code:
                     # Whole file deleted -- every function it contained is
                     # genuinely gone, not a diff against nothing.
@@ -138,7 +139,7 @@ def run_pipeline(repo_url, max_commits=450):
                         if body and len(body) >= 80:
                             conn.execute(
                                 'INSERT INTO function_events (commit_hash, file_path, qualified_name, event_type, old_qualified_name, similarity) VALUES (?, ?, ?, ?, ?, ?)',
-                                (commit.hash, mf.filename, name, 'deleted', None, None))
+                                (commit.hash, file_path, name, 'deleted', None, None))
             if count % 20 == 0:
                 conn.commit()
                 registry.set_status(repo_key, processed=count)

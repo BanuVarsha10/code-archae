@@ -90,7 +90,7 @@ def api_lifeline(name: str, repo: str):
 def api_explain(name: str, repo: str):
     conn = get_conn(repo)
     explanation, red_flags, event_mismatches, hallucinated_issues, was_cached, generated_at = (
-        core.get_cached_or_generate(name, conn)
+        core.get_cached_or_generate(name, conn, repo)
     )
     total_flags = sum(red_flags.values()) if red_flags else 0
     severity = "severe" if total_flags > 10 else "moderate" if total_flags > 3 else ("minor" if total_flags else None)
@@ -98,7 +98,7 @@ def api_explain(name: str, repo: str):
         confidence = "low"
     elif severity == "severe":
         confidence = "low"
-    elif severity == "moderate":
+    elif severity in ("moderate", "minor"):
         confidence = "medium"
     else:
         confidence = "high"
@@ -116,6 +116,29 @@ def api_explain(name: str, repo: str):
         ],
         "hallucinated_issues": sorted(hallucinated_issues),
     }
+
+
+@app.get("/api/repos/{repo_key}/tree")
+def api_tree(repo_key: str):
+    conn = get_conn(repo_key)
+    rows = conn.execute('''
+        SELECT file_path, qualified_name, COUNT(*) as event_count
+        FROM function_events
+        WHERE file_path IS NOT NULL
+        GROUP BY file_path, qualified_name
+        ORDER BY file_path, qualified_name
+    ''').fetchall()
+
+    tree = {}
+    for row in rows:
+        parts = row['file_path'].replace('\\', '/').split('/')
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {'__type__': 'dir', '__children__': {}})['__children__']
+        filename = parts[-1]
+        file_node = node.setdefault(filename, {'__type__': 'file', '__functions__': []})
+        file_node['__functions__'].append({'name': row['qualified_name'], 'event_count': row['event_count']})
+    return tree
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

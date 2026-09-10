@@ -1,7 +1,9 @@
-import json, os, threading
+import json, os
+from filelock import FileLock
 
 REGISTRY_PATH = 'repos.json'
-_lock = threading.Lock()
+LOCK_PATH = 'repos.json.lock'
+
 
 def _load():
     if not os.path.exists(REGISTRY_PATH):
@@ -9,22 +11,31 @@ def _load():
     with open(REGISTRY_PATH) as f:
         return json.load(f)
 
+
 def _save(data):
-    with open(REGISTRY_PATH, 'w') as f:
+    tmp_path = REGISTRY_PATH + '.tmp'
+    with open(tmp_path, 'w') as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_path, REGISTRY_PATH)
+
 
 def set_status(repo_key, **kwargs):
-    with _lock:
+    with FileLock(LOCK_PATH, timeout=15):
         data = _load()
         data.setdefault(repo_key, {})
         data[repo_key].update(kwargs)
         _save(data)
 
+
 def get_status(repo_key):
-    return _load().get(repo_key)
+    with FileLock(LOCK_PATH, timeout=15):
+        return _load().get(repo_key)
+
 
 def list_repos():
-    return _load()
+    with FileLock(LOCK_PATH, timeout=15):
+        return _load()
+
 
 def repo_key_from_url(url):
     url = url.rstrip('/')

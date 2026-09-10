@@ -1,4 +1,4 @@
-import sqlite3, re, sys, datetime, json
+import sqlite3, re, sys, os, datetime, json, ast
 import ollama
 
 conn = sqlite3.connect('archaeologist.db')
@@ -95,43 +95,91 @@ def scan_red_flags(explanation):
 def check_event_type_consistency(explanation, events):
     event_type_by_hash = {row['commit_hash'][:8]: row['event_type'] for row in events}
     keyword_to_type = {
-        'added': 'added', 'created': 'added',
+        'added': 'added', 'addition': 'added', 'created': 'added', 'creation': 'added',
         'modified': 'modified', 'modification': 'modified', 'changed': 'modified', 'updated': 'modified',
-        'deleted': 'deleted', 'deletion': 'deleted', 'removed': 'deleted',
-        'renamed': 'renamed', 'rename': 'renamed',
+        'deleted': 'deleted', 'deletion': 'deleted', 'removed': 'deleted', 'removal': 'deleted',
+        'renamed': 'renamed', 'rename': 'renamed', 'renaming': 'renamed',
     }
     sentences = re.split(r'(?<=[.!?])\s+', explanation)
     mismatches = []
     for sentence in sentences:
-        # Strip quoted spans (PR titles being cited) before keyword-matching --
-        # quoted text is source material, not a claim the model itself is making.
-        sentence_for_keywords = re.sub(r'"[^"]*"', '', sentence)
-        hashes_in_sentence = re.findall(r'\b[0-9a-f]{6,8}\b', sentence)
-        for h in hashes_in_sentence:
-            true_type = event_type_by_hash.get(h) or event_type_by_hash.get(h.zfill(8))
-            if not true_type:
-                continue
-            for keyword, claimed_type in keyword_to_type.items():
-                if keyword in sentence_for_keywords.lower() and claimed_type != true_type:
-                    mismatches.append((h, keyword, claimed_type, true_type, sentence.strip()))
+        # Split further into clauses so a keyword in one clause of a sentence
+        # doesn't get cross-checked against a hash that only appears in a
+        # different clause of the same sentence -- this was the exact real
+        # bug that let a fabricated claim about e9c0f742 slip through.
+        clauses = re.split(r',\s*(?:and|but)\s+|;\s*', sentence)
+        for clause in clauses:
+            clause_for_keywords = re.sub(r'"[^"]*"', '', clause)
+            hashes_in_clause = re.findall(r'\b[0-9a-f]{6,8}\b', clause)
+            for h in hashes_in_clause:
+                true_type = event_type_by_hash.get(h) or event_type_by_hash.get(h.zfill(8))
+                if not true_type:
+                    continue
+                for keyword, claimed_type in keyword_to_type.items():
+                    if keyword in clause_for_keywords.lower() and claimed_type != true_type:
+                        mismatches.append((h, keyword, claimed_type, true_type, clause.strip()))
     return mismatches
 
-def generate_explanation(name, conn):
+def get_current_source(repo_key, qualified_name, conn):
+    row = conn.execute('''
+        SELECT file_path FROM function_events fe
+        JOIN commits c ON fe.commit_hash = c.hash
+        WHERE qualified_name = ? AND event_type != 'deleted'
+        ORDER BY c.date DESC LIMIT 1
+    ''', (qualified_name,)).fetchone()
+    if not row:
+        return None, None
+    file_path = row['file_path']
+    full_path = os.path.join('repos', repo_key, file_path)
+    if not os.path.exists(full_path):
+        return None, file_path
+    with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+        source = f.read()
+
+    class SourceFF(ast.NodeVisitor):
+        def __init__(self, source):
+            self.source = source; self.functions = {}; self.stack = []
+        def visit_ClassDef(self, n):
+            self.stack.append(n.name); self.generic_visit(n); self.stack.pop()
+        def visit_FunctionDef(self, n):
+            self.functions['.'.join(self.stack + [n.name])] = ast.get_source_segment(self.source, n)
+            self.generic_visit(n)
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None, file_path
+    ff = SourceFF(source); ff.visit(tree)
+    return ff.functions.get(qualified_name), file_path
+
+def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
     events = get_lifeline(name, conn)
     if not events:
         return f"No tracked history found for '{name}'.", [], [], set()
     context, valid_hashes, valid_issue_numbers = format_lifeline_context(name, events, conn)
+    current_source, current_file = get_current_source(repo_key, name, conn)
+    if current_source:
+        context += f"\n\nCurrent source code (in {current_file}):\n```python\n{current_source}\n```"
     system_prompt = (
-        "You explain why a function exists and how it evolved, using ONLY the "
-        "structured history provided below. Do NOT use words like 'likely', "
-        "'probably', 'this suggests', 'aimed to', or any language implying "
-        "motivation or purpose that is not explicitly stated in a PR title. "
-        "If a PR title does not explain why a change was made, say plainly "
-        "that the reason is not captured in the available data, rather than "
-        "guessing. Cite specific commit hashes (the 8-character codes) for "
-        "claims where relevant. If the history is sparse, keep your "
-        "explanation proportionately short rather than padding it. Do not "
-        "invent commit hashes that are not in the data."
+        "You have two separate tasks -- keep them clearly apart in your answer.\n\n"
+        "TASK 1 -- WHAT IT DOES: given the function's current source code "
+        "(provided below, if available), explain what it does mechanically. "
+        "Walk through the actual logic, grounded strictly in the literal code "
+        "shown. Do NOT speculate about how other parts of the codebase call "
+        "or depend on this function -- that information has not been "
+        "provided to you, so only describe what is visible in the code "
+        "itself.\n\n"
+        "TASK 2 -- HISTORY: explain why this function exists and how it "
+        "evolved, using ONLY the structured history provided below. Do NOT "
+        "use words like 'likely', 'probably', 'this suggests', 'aimed to', "
+        "or any language implying motivation not explicitly stated in a PR "
+        "title. If a PR title does not explain why a change was made, say "
+        "plainly that the reason is not captured, rather than guessing. "
+        "Cite specific commit hashes for claims where relevant. Do not "
+        "invent commit hashes that are not in the data.\n\n"
+        "Structure your response as two sections: 'What it does' and "
+        "'History'."
     )
     response = ollama.chat(
         model='llama3.2:3b',
@@ -147,7 +195,7 @@ def generate_explanation(name, conn):
     event_mismatches = check_event_type_consistency(explanation, events)
     return explanation, red_flags, event_mismatches, hallucinated_issues
 
-def get_cached_or_generate(name, conn):
+def get_cached_or_generate(name, conn, repo_key):
     existing_cols = {row['name'] for row in conn.execute('PRAGMA table_info(explanations)').fetchall()}
     for col in ['red_flags', 'event_mismatches', 'hallucinated_issues']:
         if col not in existing_cols:
@@ -164,7 +212,7 @@ def get_cached_or_generate(name, conn):
         hallucinated_issues = set(json.loads(cached['hallucinated_issues']))
         return cached['explanation'], red_flags, event_mismatches, hallucinated_issues, True, cached['generated_at']
 
-    explanation, red_flags, event_mismatches, hallucinated_issues = generate_explanation(name, conn)
+    explanation, red_flags, event_mismatches, hallucinated_issues = generate_explanation(name, conn, repo_key)
     now = datetime.datetime.now().isoformat(timespec='seconds')
     conn.execute(
         '''INSERT OR REPLACE INTO explanations
@@ -233,7 +281,7 @@ def main():
             name = matches[0]['qualified_name']
 
         print(f"\nLooking up {name}...")
-        explanation, red_flags, event_mismatches, hallucinated_issues, was_cached, generated_at = get_cached_or_generate(name, conn)
+        explanation, red_flags, event_mismatches, hallucinated_issues, was_cached, generated_at = get_cached_or_generate(name, conn, 'encode_httpx')
         if was_cached:
             print(f"(cached, generated {generated_at})\n")
         else:

@@ -2,7 +2,9 @@ httpx/
 repos/
 *.db
 repos.json
+repos.json.lock
 uvicorn.log
+server.log
 __pycache__/
 *.pyc
 .env

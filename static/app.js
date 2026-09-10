@@ -238,3 +238,100 @@ searchInput.addEventListener('input', () => {
 });
 
 loadRepos();
+
+const treeViewEl = document.getElementById('tree-view');
+const panelTabs = document.querySelectorAll('.panel-tab');
+let currentView = 'ranked';
+let treeCache = null;
+
+panelTabs.forEach(tab => {
+  tab.addEventListener('click', () => {
+    panelTabs.forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentView = tab.dataset.view;
+    searchInput.value = '';
+    if (currentView === 'tree') {
+      listEl.classList.add('hidden');
+      treeViewEl.classList.remove('hidden');
+      panelLabel.textContent = '';
+      loadTree();
+    } else {
+      treeViewEl.classList.add('hidden');
+      listEl.classList.remove('hidden');
+      loadList('');
+    }
+  });
+});
+
+async function loadTree() {
+  if (!currentRepo) return;
+  if (!treeCache) {
+    const res = await fetch(`/api/repos/${encodeURIComponent(currentRepo)}/tree`);
+    treeCache = await res.json();
+  }
+  treeViewEl.innerHTML = '';
+  treeViewEl.appendChild(renderTreeLevel(treeCache));
+}
+
+function renderTreeLevel(node) {
+  const container = document.createElement('div');
+  const entries = Object.entries(node).sort((a, b) => {
+    const aIsDir = a[1].__type__ === 'dir';
+    const bIsDir = b[1].__type__ === 'dir';
+    if (aIsDir !== bIsDir) return aIsDir ? -1 : 1;
+    return a[0].localeCompare(b[0]);
+  });
+
+  entries.forEach(([name, value]) => {
+    const nodeEl = document.createElement('div');
+    nodeEl.className = 'tree-node';
+
+    if (value.__type__ === 'dir') {
+      const row = document.createElement('div');
+      row.className = 'tree-row';
+      row.innerHTML = `<span class="tree-caret">▸</span><span class="tree-dir-name">${escapeHtml(name)}</span>`;
+      const childrenEl = document.createElement('div');
+      childrenEl.className = 'tree-children';
+      childrenEl.appendChild(renderTreeLevel(value.__children__));
+      row.addEventListener('click', () => {
+        row.querySelector('.tree-caret').classList.toggle('open');
+        childrenEl.classList.toggle('open');
+      });
+      nodeEl.appendChild(row);
+      nodeEl.appendChild(childrenEl);
+    } else {
+      const row = document.createElement('div');
+      row.className = 'tree-row';
+      row.innerHTML = `<span class="tree-caret">▸</span><span class="tree-file-name">${escapeHtml(name)}</span>`;
+      const childrenEl = document.createElement('div');
+      childrenEl.className = 'tree-children';
+      value.__functions__.forEach(fn => {
+        const fnRow = document.createElement('div');
+        fnRow.className = 'tree-function-row';
+        fnRow.textContent = fn.name;
+        const countSpan = document.createElement('span');
+        countSpan.className = 'tree-function-count';
+        countSpan.textContent = `${fn.event_count}`;
+        fnRow.appendChild(countSpan);
+        fnRow.addEventListener('click', (e) => {
+          e.stopPropagation();
+          document.querySelectorAll('.tree-function-row').forEach(el => el.classList.remove('active'));
+          fnRow.classList.add('active');
+          selectFunction(fn.name);
+        });
+        childrenEl.appendChild(fnRow);
+      });
+      row.addEventListener('click', () => {
+        row.querySelector('.tree-caret').classList.toggle('open');
+        childrenEl.classList.toggle('open');
+      });
+      nodeEl.appendChild(row);
+      nodeEl.appendChild(childrenEl);
+    }
+    container.appendChild(nodeEl);
+  });
+
+  return container;
+}
+
+repoSelect.addEventListener('change', () => { treeCache = null; });

@@ -139,6 +139,101 @@ after processing more commit history past the current 450) -- pipeline.py's
 existing wipe-and-rebuild step should also clear this table, but doesn't
 yet.
 
+## Multi-repo hardening (this session)
+
+### Cross-process race condition in repo_registry.py -- found and fixed
+threading.Lock() only serializes threads within ONE Python process. Every
+indexing job runs as a SEPARATE OS process (subprocess.Popen), so the lock
+was providing zero real protection -- confirmed by reproducing the exact
+crash ("Expecting value: line 1 column 1 (char 0)") from two plain OS
+processes racing on repos.json, with no git/pipeline complexity involved
+at all. Worse than a crash: one process's data was silently lost entirely
+when the other's write raced past it (a "lost update", not just corruption).
+FIX: replaced threading.Lock with the `filelock` library (real cross-process
+locking) plus atomic writes (write to a .tmp file, then os.replace() onto
+the real path, so a reader can never observe a half-written file). Verified
+with 5 repeated concurrent-process test runs, zero crashes, zero lost
+updates, before trusting it.
+
+### Windows path-separator bug -- found by real Windows testing, not by me
+mf.new_path / mf.old_path return backslash-separated paths on Windows
+(e.g. 'httpcore\api.py'), but /tree splits on '/', so nothing nested --
+every file landed flat with a literal backslash in its name. This was
+invisible in Linux-only testing (backslash paths can't occur there) and
+was caught via direct raw-DB inspection (repr() on stored file_path values)
+on the actual Windows dev machine. FIX: normalize backslash to forward
+slash before splitting, in api_tree (app.py).
+IMPORTANT, separately: some repos genuinely DO have the same filename at
+two different real paths across their history (e.g. Fin-rag_genai's
+agents.py -> finsage/agents.py, confirmed via commit trace: added at
+root, deleted, re-added under finsage/ in a commit literally titled
+"Fixed finsage folder (removed submodule)"). That's correct, expected
+tree behavior, not a bug -- don't conflate the two issues if this comes
+up again.
+
+## File tree view
+New /api/repos/{repo_key}/tree endpoint: groups function_events by
+file_path (nested by directory) and qualified_name. Frontend: a
+"File tree" / "Most excavated" tab toggle in the sidebar, recursive
+expand-on-click rendering. .tree-children needs `padding-left` in CSS --
+without it, nesting is structurally correct but doesn't LOOK nested
+(this was shipped once without the padding, caught in review, fixed with
+one CSS line since each depth level already wraps in its own container
+and the indentation compounds naturally).
+
+## Code-explanation feature: "What it does" + "History"
+generate_explanation now also fetches the function's CURRENT source (via
+get_current_source: finds the most recent non-deleted event's file_path,
+reads that file from the local clone in repos/{repo_key}/, extracts the
+function's source via the same AST logic used everywhere else) and feeds
+it to the model as additional grounded context. System prompt now asks
+for two explicitly separate sections -- "What it does" (grounded in the
+literal current code, no speculation about how other code calls this
+function, since we don't track that) and "History" (grounded in the
+lifeline, as before). Verified accurate against real code (cosine_similarity
+in Fin-rag_genai: model correctly described the dot-product computation
+and unit-normalization assumption from the actual source and docstring).
+KNOWN LIMITATION: the legacy standalone archaeologist.db / cli.py main()
+path has pre-path-fix data (bare filenames), so get_current_source
+silently returns None there. Not a crash, just an inert feature on that
+one legacy code path. app.py is the real entry point; this wasn't worth
+fixing on the legacy path.
+
+## Checker precision fix -- a real fabrication caught in the wild, root-caused precisely
+Real example: given real events (cd169d6c=added, e9c0f742=deleted,
+66e1d5f2=added), the model generated: "...marks the deletion of the
+function, and a second commit hash e9c0f742 marks the addition of the
+function's implementation." -- fabricating that e9c0f742 was an addition
+when it's actually the deletion.
+check_event_type_consistency did NOT catch this on first pass. Root
+cause, verified precisely (not guessed): (1) "addition" was never in the
+keyword dictionary, so the checker couldn't compare it against anything,
+and (2) the checker matched "any keyword in the sentence" against "any
+hash in the sentence" without binding a keyword to its actual clause --
+so it found "deletion" elsewhere in the same sentence, which happened to
+be e9c0f742's correct type BY COINCIDENCE, and reported a false clean
+pass.
+FIX: (1) expanded the keyword dictionary with noun forms (addition,
+creation, removal, renaming, etc.), (2) split sentences into clauses
+(on ", and " / ", but " / ";") before cross-referencing, so a keyword in
+one clause can't be matched against a hash that only appears in a
+different clause. Verified by feeding the EXACT original fabricated
+sentence through the fixed checker directly (not a fresh non-deterministic
+regeneration, which would have been an invalid test either way it came
+out) -- confirmed it now correctly flags the mismatch.
+RESIDUAL, DISTINCT GAP: a clause that refers to a commit via pronoun
+("the same commit hash") instead of repeating the literal hex hash still
+can't be checked -- there's no hash-token for the checker to key off.
+This is coreference resolution, a genuinely different problem from the
+clause-boundary bug just fixed, not a sign the fix is incomplete. Would
+need actual NLP-style reference resolution to close, not a bigger keyword
+dictionary.
+STANDING LIMITATION, stated plainly: this checker catches specific,
+now-broadened failure patterns found through real evidence. It does not
+solve narrative fabrication in general. A claim using a word-form still
+missing from the dictionary, or no recognizable keyword at all, still
+slips through undetected.
+
 ## Files built so far
 - explore.py, explore_ast.py — early proof-of-concept scripts (Phase 1-2)
 - match_functions.py — standalone matcher demo
@@ -149,7 +244,13 @@ yet.
   of Phase 5)
 - cli.py — persistent interactive CLI: ranked/searchable function listing,
   explanation generation with caching, all four deterministic grounding
-  checks. This is the current, most complete entry point to the project.
+  checks, get_current_source (reads a function's current source from its
+  repo clone for source-grounded "What it does" explanations). This is
+  the current, most complete entry point to the project.
+- app.py — FastAPI backend serving the web UI: repo management, function
+  listing/search, lifeline + explain endpoints, and
+  /api/repos/{repo_key}/tree (file-tree view grouping function_events by
+  file_path and qualified_name).
 
 ## What's NOT built yet
 - Any CLI beyond `python explain.py <function_name>` — no way to list or

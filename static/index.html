@@ -33,8 +33,13 @@
 
 <div class="layout">
   <aside class="site-panel">
-    <div class="panel-label" id="panel-label">Most excavated</div>
+    <div class="panel-tabs">
+      <button class="panel-tab active" data-view="ranked">Most excavated</button>
+      <button class="panel-tab" data-view="tree">File tree</button>
+    </div>
+    <div class="panel-label" id="panel-label"></div>
     <ul id="function-list" class="function-list"></ul>
+    <div id="tree-view" class="tree-view hidden"></div>
   </aside>
 
   <main class="detail-panel" id="detail-panel">
