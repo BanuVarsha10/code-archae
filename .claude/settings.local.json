@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python explore.py)",
+      "Bash(python pipeline.py)"
+    ]
+  }
+}

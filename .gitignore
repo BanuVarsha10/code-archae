@@ -2,3 +2,4 @@ httpx/
 archaeologist.db
 __pycache__/
 *.pyc
+.env

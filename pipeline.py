@@ -23,31 +23,55 @@ def extract(source):
 def classify_events(before, after, threshold=0.75, min_len=80):
     before_f = [(n, b) for n, b in before if b and len(b) >= min_len]
     after_f  = [(n, b) for n, b in after if b and len(b) >= min_len]
+
+    from collections import Counter
+    before_counts = Counter(n for n, _ in before_f)
+    after_counts = Counter(n for n, _ in after_f)
+
     events = []
-    if before_f and after_f:
-        sim = np.zeros((len(before_f), len(after_f)))
-        for i, (_, ob) in enumerate(before_f):
-            for j, (_, nb) in enumerate(after_f):
+    matched_old_idx, matched_new_idx = set(), set()
+
+    # Tier 1: names appearing exactly once on both sides are treated as the
+    # same function, 'modified', regardless of body similarity. Identity
+    # (the name) is a stronger, cheaper signal than content similarity when
+    # it's unambiguous.
+    for i, (name, _) in enumerate(before_f):
+        if before_counts[name] == 1 and after_counts.get(name, 0) == 1:
+            for j, (name2, _) in enumerate(after_f):
+                if name2 == name:
+                    events.append((name, 'modified', None, None))
+                    matched_old_idx.add(i); matched_new_idx.add(j)
+                    break
+
+    # Tier 2: everything left (ambiguous duplicate names, genuine renames,
+    # additions, deletions) goes through optimal similarity matching.
+    remaining_before = [(n, b) for i, (n, b) in enumerate(before_f) if i not in matched_old_idx]
+    remaining_after  = [(n, b) for j, (n, b) in enumerate(after_f) if j not in matched_new_idx]
+
+    if remaining_before and remaining_after:
+        sim = np.zeros((len(remaining_before), len(remaining_after)))
+        for i, (_, ob) in enumerate(remaining_before):
+            for j, (_, nb) in enumerate(remaining_after):
                 sim[i][j] = difflib.SequenceMatcher(None, ob, nb).ratio()
         row_ind, col_ind = linear_sum_assignment(1 - sim)
-        matched_old, matched_new = set(), set()
+        matched_r, matched_c = set(), set()
         for r, c in zip(row_ind, col_ind):
             if sim[r][c] >= threshold:
-                old_name, new_name = before_f[r][0], after_f[c][0]
-                matched_old.add(r); matched_new.add(c)
+                old_name, new_name = remaining_before[r][0], remaining_after[c][0]
+                matched_r.add(r); matched_c.add(c)
                 if old_name == new_name:
                     events.append((new_name, 'modified', None, sim[r][c]))
                 else:
                     events.append((new_name, 'renamed', old_name, sim[r][c]))
-        for i, (name, _) in enumerate(before_f):
-            if i not in matched_old:
+        for i, (name, _) in enumerate(remaining_before):
+            if i not in matched_r:
                 events.append((name, 'deleted', None, None))
-        for j, (name, _) in enumerate(after_f):
-            if j not in matched_new:
+        for j, (name, _) in enumerate(remaining_after):
+            if j not in matched_c:
                 events.append((name, 'added', None, None))
     else:
-        events += [(n, 'deleted', None, None) for n, _ in before_f]
-        events += [(n, 'added', None, None) for n, _ in after_f]
+        events += [(n, 'deleted', None, None) for n, _ in remaining_before]
+        events += [(n, 'added', None, None) for n, _ in remaining_after]
     return events
 
 conn = sqlite3.connect('archaeologist.db')
@@ -58,12 +82,14 @@ conn.execute('''CREATE TABLE IF NOT EXISTS function_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     commit_hash TEXT, file_path TEXT, qualified_name TEXT,
     event_type TEXT, old_qualified_name TEXT, similarity REAL)''')
+conn.execute('DELETE FROM function_events')
+conn.execute('DELETE FROM commits')
 conn.execute('CREATE INDEX IF NOT EXISTS idx_events_name ON function_events(qualified_name)')
 
 count = 0
 for commit in Repository('httpx').traverse_commits():
     count += 1
-    if count > 150:
+    if count > 450:
         break
     conn.execute('INSERT OR IGNORE INTO commits VALUES (?, ?, ?, ?)',
                   (commit.hash, commit.author.name, str(commit.author_date), commit.msg.splitlines()[0]))
