@@ -1,4 +1,4 @@
-import sqlite3, re, sys, datetime
+import sqlite3, re, sys, datetime, json
 import ollama
 
 conn = sqlite3.connect('archaeologist.db')
@@ -148,12 +148,30 @@ def generate_explanation(name, conn):
     return explanation, red_flags, event_mismatches, hallucinated_issues
 
 def get_cached_or_generate(name, conn):
-    cached = conn.execute('SELECT explanation, generated_at FROM explanations WHERE qualified_name = ?', (name,)).fetchone()
-    if cached:
-        return cached['explanation'], [], [], set(), True, cached['generated_at']
+    existing_cols = {row['name'] for row in conn.execute('PRAGMA table_info(explanations)').fetchall()}
+    for col in ['red_flags', 'event_mismatches', 'hallucinated_issues']:
+        if col not in existing_cols:
+            conn.execute(f'ALTER TABLE explanations ADD COLUMN {col} TEXT')
+    conn.commit()
+
+    cached = conn.execute(
+        'SELECT explanation, generated_at, red_flags, event_mismatches, hallucinated_issues FROM explanations WHERE qualified_name = ?',
+        (name,)
+    ).fetchone()
+    if cached and cached['red_flags'] is not None:
+        red_flags = json.loads(cached['red_flags'])
+        event_mismatches = json.loads(cached['event_mismatches'])
+        hallucinated_issues = set(json.loads(cached['hallucinated_issues']))
+        return cached['explanation'], red_flags, event_mismatches, hallucinated_issues, True, cached['generated_at']
+
     explanation, red_flags, event_mismatches, hallucinated_issues = generate_explanation(name, conn)
     now = datetime.datetime.now().isoformat(timespec='seconds')
-    conn.execute('INSERT OR REPLACE INTO explanations VALUES (?, ?, ?)', (name, explanation, now))
+    conn.execute(
+        '''INSERT OR REPLACE INTO explanations
+           (qualified_name, explanation, generated_at, red_flags, event_mismatches, hallucinated_issues)
+           VALUES (?, ?, ?, ?, ?, ?)''',
+        (name, explanation, now, json.dumps(red_flags), json.dumps(event_mismatches), json.dumps(list(hallucinated_issues)))
+    )
     conn.commit()
     return explanation, red_flags, event_mismatches, hallucinated_issues, False, now
 

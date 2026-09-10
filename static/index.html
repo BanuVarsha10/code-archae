@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Code Archaeologist</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;700;900&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="stripe"></div>
+
+<header class="topbar">
+  <div class="wordmark">Code Archaeologist<span class="dot">.</span></div>
+  <select id="repo-select" class="repo-select"></select>
+  <button id="add-repo-btn" class="add-repo-btn">+ Add repo</button>
+  <input id="search" class="search-input" type="text" placeholder="Search functions, e.g. close, Response, URL…" autocomplete="off">
+</header>
+
+<div id="add-repo-modal" class="modal hidden">
+  <div class="modal-box">
+    <h2>Index a new repo</h2>
+    <p class="modal-sub">Public GitHub URL, default branch only. This takes real minutes, not seconds.</p>
+    <input id="repo-url-input" type="text" placeholder="https://github.com/owner/repo.git">
+    <div class="modal-actions">
+      <button id="cancel-add-repo">Cancel</button>
+      <button id="confirm-add-repo" class="reveal-btn">Start indexing</button>
+    </div>
+    <div id="indexing-status"></div>
+  </div>
+</div>
+
+<div class="layout">
+  <aside class="site-panel">
+    <div class="panel-label" id="panel-label">Most excavated</div>
+    <ul id="function-list" class="function-list"></ul>
+  </aside>
+
+  <main class="detail-panel" id="detail-panel">
+    <div class="empty-state">
+      <p>Select a function on the left to begin.</p>
+      <p class="empty-sub">Each one carries a buried history of renames, rewrites, and the discussions behind them.</p>
+    </div>
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
