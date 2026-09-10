@@ -32,10 +32,12 @@ def get_lifeline(name, conn):
     all_events.sort(key=lambda r: r['date'])
     return all_events
 
-def format_lifeline_context(name, events, conn):
+def format_lifeline_context(name, events, conn, max_full_events=15):
     lines = [f'Function: {name}', f'Total tracked events: {len(events)}', '']
     valid_hashes = set()
-    for row in events:
+    valid_issue_numbers = set()
+
+    def format_event_line(row):
         valid_hashes.add(row['commit_hash'][:8])
         issue_num = None
         m = pattern.search(row['message'])
@@ -43,18 +45,52 @@ def format_lifeline_context(name, events, conn):
         issue_title = None
         if issue_num:
             issue = conn.execute('SELECT title FROM issues WHERE number = ?', (issue_num,)).fetchone()
-            if issue: issue_title = issue['title']
+            if issue:
+                issue_title = issue['title']
+                valid_issue_numbers.add(issue_num)
         line = f"- {row['date'][:10]} ({row['commit_hash'][:8]}): {row['event_type']}"
         if row['old_qualified_name']:
             line += f" (renamed from {row['old_qualified_name']})"
         if issue_title:
             line += f' -- PR #{issue_num}: "{issue_title}"'
-        lines.append(line)
-    return '\n'.join(lines), valid_hashes
+        return line
+
+    if len(events) <= max_full_events:
+        for row in events:
+            lines.append(format_event_line(row))
+    else:
+        renames = [e for e in events if e['event_type'] == 'renamed']
+        candidates = list(events[:5]) + renames + list(events[-5:])
+        seen_hashes = set()
+        important = []
+        for e in candidates:
+            if e['commit_hash'] not in seen_hashes:
+                important.append(e)
+                seen_hashes.add(e['commit_hash'])
+        important.sort(key=lambda r: r['date'])
+        omitted = len(events) - len(important)
+        lines.append(
+            f"(Showing {len(important)} of {len(events)} tracked events: the "
+            f"earliest and most recent activity, plus any renames. "
+            f"{omitted} additional modifications exist but are omitted here "
+            f"for brevity -- do NOT speculate about what they contained or "
+            f"why they happened, and do not claim the shown events are the "
+            f"only changes that occurred.)"
+        )
+        lines.append("")
+        for row in important:
+            lines.append(format_event_line(row))
+
+    return '\n'.join(lines), valid_hashes, valid_issue_numbers
 
 def scan_red_flags(explanation):
     lowered = explanation.lower()
-    return [p for p in RED_FLAG_PHRASES if p in lowered]
+    counts = {}
+    for phrase in RED_FLAG_PHRASES:
+        c = lowered.count(phrase)
+        if c > 0:
+            counts[phrase] = c
+    return counts
 
 def check_event_type_consistency(explanation, events):
     event_type_by_hash = {row['commit_hash'][:8]: row['event_type'] for row in events}
@@ -67,21 +103,24 @@ def check_event_type_consistency(explanation, events):
     sentences = re.split(r'(?<=[.!?])\s+', explanation)
     mismatches = []
     for sentence in sentences:
+        # Strip quoted spans (PR titles being cited) before keyword-matching --
+        # quoted text is source material, not a claim the model itself is making.
+        sentence_for_keywords = re.sub(r'"[^"]*"', '', sentence)
         hashes_in_sentence = re.findall(r'\b[0-9a-f]{6,8}\b', sentence)
         for h in hashes_in_sentence:
             true_type = event_type_by_hash.get(h) or event_type_by_hash.get(h.zfill(8))
             if not true_type:
                 continue
             for keyword, claimed_type in keyword_to_type.items():
-                if keyword in sentence.lower() and claimed_type != true_type:
+                if keyword in sentence_for_keywords.lower() and claimed_type != true_type:
                     mismatches.append((h, keyword, claimed_type, true_type, sentence.strip()))
     return mismatches
 
 def generate_explanation(name, conn):
     events = get_lifeline(name, conn)
     if not events:
-        return f"No tracked history found for '{name}'.", [], []
-    context, valid_hashes = format_lifeline_context(name, events, conn)
+        return f"No tracked history found for '{name}'.", [], [], set()
+    context, valid_hashes, valid_issue_numbers = format_lifeline_context(name, events, conn)
     system_prompt = (
         "You explain why a function exists and how it evolved, using ONLY the "
         "structured history provided below. Do NOT use words like 'likely', "
@@ -103,18 +142,20 @@ def generate_explanation(name, conn):
     )
     explanation = response['message']['content']
     red_flags = scan_red_flags(explanation)
+    cited_issues = set(int(n) for n in re.findall(r'#(\d+)', explanation))
+    hallucinated_issues = cited_issues - valid_issue_numbers
     event_mismatches = check_event_type_consistency(explanation, events)
-    return explanation, red_flags, event_mismatches
+    return explanation, red_flags, event_mismatches, hallucinated_issues
 
 def get_cached_or_generate(name, conn):
     cached = conn.execute('SELECT explanation, generated_at FROM explanations WHERE qualified_name = ?', (name,)).fetchone()
     if cached:
-        return cached['explanation'], [], [], True, cached['generated_at']
-    explanation, red_flags, event_mismatches = generate_explanation(name, conn)
+        return cached['explanation'], [], [], set(), True, cached['generated_at']
+    explanation, red_flags, event_mismatches, hallucinated_issues = generate_explanation(name, conn)
     now = datetime.datetime.now().isoformat(timespec='seconds')
     conn.execute('INSERT OR REPLACE INTO explanations VALUES (?, ?, ?)', (name, explanation, now))
     conn.commit()
-    return explanation, red_flags, event_mismatches, False, now
+    return explanation, red_flags, event_mismatches, hallucinated_issues, False, now
 
 def list_top_functions(conn, limit=20):
     return conn.execute('''SELECT qualified_name, COUNT(*) as event_count
@@ -174,7 +215,7 @@ def main():
             name = matches[0]['qualified_name']
 
         print(f"\nLooking up {name}...")
-        explanation, red_flags, event_mismatches, was_cached, generated_at = get_cached_or_generate(name, conn)
+        explanation, red_flags, event_mismatches, hallucinated_issues, was_cached, generated_at = get_cached_or_generate(name, conn)
         if was_cached:
             print(f"(cached, generated {generated_at})\n")
         else:
@@ -182,9 +223,13 @@ def main():
         print(explanation)
         if not was_cached:
             if red_flags:
-                print(f"\n[red-flag phrases detected: {red_flags}]")
+                total_flags = sum(red_flags.values())
+                severity = "SEVERE" if total_flags > 10 else "moderate" if total_flags > 3 else "minor"
+                print(f"\n[{severity} - red-flag phrases detected (with counts): {red_flags}]")
             if event_mismatches:
                 print(f"\n[event-type mismatches detected: {len(event_mismatches)}]")
+            if hallucinated_issues:
+                print(f"\n[hallucinated issue/PR citations detected: {hallucinated_issues}]")
         print()
 
 if __name__ == '__main__':
