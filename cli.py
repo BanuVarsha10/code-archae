@@ -1,5 +1,6 @@
 import sqlite3, re, sys, os, datetime, json, ast
 import ollama
+import build_call_graph
 
 conn = sqlite3.connect('archaeologist.db')
 conn.row_factory = sqlite3.Row
@@ -120,6 +121,15 @@ def check_event_type_consistency(explanation, events):
                         mismatches.append((h, keyword, claimed_type, true_type, clause.strip()))
     return mismatches
 
+def check_connections_overclaim(explanation):
+    overclaim_phrases = [
+        'not called by any', 'calls no other', 'has no callers',
+        'is not called', 'calls nothing', 'is unused', 'never called',
+        'not used anywhere', 'no other function calls', 'not called anywhere',
+    ]
+    lowered = explanation.lower()
+    return [p for p in overclaim_phrases if p in lowered]
+
 def get_current_source(repo_key, qualified_name, conn):
     row = conn.execute('''
         SELECT file_path FROM function_events fe
@@ -156,21 +166,27 @@ def get_current_source(repo_key, qualified_name, conn):
 def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
     events = get_lifeline(name, conn)
     if not events:
-        return f"No tracked history found for '{name}'.", [], [], set()
+        return f"No tracked history found for '{name}'.", [], [], set(), []
     context, valid_hashes, valid_issue_numbers = format_lifeline_context(name, events, conn)
     current_source, current_file = get_current_source(repo_key, name, conn)
     if current_source:
         context += f"\n\nCurrent source code (in {current_file}):\n```python\n{current_source}\n```"
+    call_context = build_call_graph.format_call_context(name, conn)
+    context += f"\n\n{call_context}"
     system_prompt = (
-        "You have two separate tasks -- keep them clearly apart in your answer.\n\n"
+        "You have three separate tasks -- keep them clearly apart in your answer.\n\n"
         "TASK 1 -- WHAT IT DOES: given the function's current source code "
         "(provided below, if available), explain what it does mechanically. "
         "Walk through the actual logic, grounded strictly in the literal code "
-        "shown. Do NOT speculate about how other parts of the codebase call "
-        "or depend on this function -- that information has not been "
-        "provided to you, so only describe what is visible in the code "
-        "itself.\n\n"
-        "TASK 2 -- HISTORY: explain why this function exists and how it "
+        "shown.\n\n"
+        "TASK 2 -- CONNECTIONS: given the call-relationship data below, "
+        "describe what this function calls and what calls it. This data is "
+        "explicitly incomplete (only self./cls. calls are tracked) -- NEVER "
+        "state or imply that a function 'has no callers', 'is never called', "
+        "'calls nothing', or 'is unused' just because the list is short or "
+        "empty. For ambiguous relationships, state the ambiguity and list "
+        "the real candidates -- do not pick one arbitrarily.\n\n"
+        "TASK 3 -- HISTORY: explain why this function exists and how it "
         "evolved, using ONLY the structured history provided below. Do NOT "
         "use words like 'likely', 'probably', 'this suggests', 'aimed to', "
         "or any language implying motivation not explicitly stated in a PR "
@@ -178,8 +194,8 @@ def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
         "plainly that the reason is not captured, rather than guessing. "
         "Cite specific commit hashes for claims where relevant. Do not "
         "invent commit hashes that are not in the data.\n\n"
-        "Structure your response as two sections: 'What it does' and "
-        "'History'."
+        "Structure your response as three sections: 'What it does', "
+        "'Connections', and 'History'."
     )
     response = ollama.chat(
         model='llama3.2:3b',
@@ -193,35 +209,37 @@ def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
     cited_issues = set(int(n) for n in re.findall(r'#(\d+)', explanation))
     hallucinated_issues = cited_issues - valid_issue_numbers
     event_mismatches = check_event_type_consistency(explanation, events)
-    return explanation, red_flags, event_mismatches, hallucinated_issues
+    connections_overclaims = check_connections_overclaim(explanation)
+    return explanation, red_flags, event_mismatches, hallucinated_issues, connections_overclaims
 
 def get_cached_or_generate(name, conn, repo_key):
     existing_cols = {row['name'] for row in conn.execute('PRAGMA table_info(explanations)').fetchall()}
-    for col in ['red_flags', 'event_mismatches', 'hallucinated_issues']:
+    for col in ['red_flags', 'event_mismatches', 'hallucinated_issues', 'connections_overclaims']:
         if col not in existing_cols:
             conn.execute(f'ALTER TABLE explanations ADD COLUMN {col} TEXT')
     conn.commit()
 
     cached = conn.execute(
-        'SELECT explanation, generated_at, red_flags, event_mismatches, hallucinated_issues FROM explanations WHERE qualified_name = ?',
+        'SELECT explanation, generated_at, red_flags, event_mismatches, hallucinated_issues, connections_overclaims FROM explanations WHERE qualified_name = ?',
         (name,)
     ).fetchone()
     if cached and cached['red_flags'] is not None:
         red_flags = json.loads(cached['red_flags'])
         event_mismatches = json.loads(cached['event_mismatches'])
         hallucinated_issues = set(json.loads(cached['hallucinated_issues']))
-        return cached['explanation'], red_flags, event_mismatches, hallucinated_issues, True, cached['generated_at']
+        connections_overclaims = json.loads(cached['connections_overclaims']) if cached['connections_overclaims'] is not None else []
+        return cached['explanation'], red_flags, event_mismatches, hallucinated_issues, connections_overclaims, True, cached['generated_at']
 
-    explanation, red_flags, event_mismatches, hallucinated_issues = generate_explanation(name, conn, repo_key)
+    explanation, red_flags, event_mismatches, hallucinated_issues, connections_overclaims = generate_explanation(name, conn, repo_key)
     now = datetime.datetime.now().isoformat(timespec='seconds')
     conn.execute(
         '''INSERT OR REPLACE INTO explanations
-           (qualified_name, explanation, generated_at, red_flags, event_mismatches, hallucinated_issues)
-           VALUES (?, ?, ?, ?, ?, ?)''',
-        (name, explanation, now, json.dumps(red_flags), json.dumps(event_mismatches), json.dumps(list(hallucinated_issues)))
+           (qualified_name, explanation, generated_at, red_flags, event_mismatches, hallucinated_issues, connections_overclaims)
+           VALUES (?, ?, ?, ?, ?, ?, ?)''',
+        (name, explanation, now, json.dumps(red_flags), json.dumps(event_mismatches), json.dumps(list(hallucinated_issues)), json.dumps(connections_overclaims))
     )
     conn.commit()
-    return explanation, red_flags, event_mismatches, hallucinated_issues, False, now
+    return explanation, red_flags, event_mismatches, hallucinated_issues, connections_overclaims, False, now
 
 def list_top_functions(conn, limit=20):
     return conn.execute('''SELECT qualified_name, COUNT(*) as event_count
@@ -281,7 +299,7 @@ def main():
             name = matches[0]['qualified_name']
 
         print(f"\nLooking up {name}...")
-        explanation, red_flags, event_mismatches, hallucinated_issues, was_cached, generated_at = get_cached_or_generate(name, conn, 'encode_httpx')
+        explanation, red_flags, event_mismatches, hallucinated_issues, connections_overclaims, was_cached, generated_at = get_cached_or_generate(name, conn, 'encode_httpx')
         if was_cached:
             print(f"(cached, generated {generated_at})\n")
         else:
@@ -296,6 +314,8 @@ def main():
                 print(f"\n[event-type mismatches detected: {len(event_mismatches)}]")
             if hallucinated_issues:
                 print(f"\n[hallucinated issue/PR citations detected: {hallucinated_issues}]")
+            if connections_overclaims:
+                print(f"\n[connections overclaim phrases detected: {connections_overclaims}]")
         print()
 
 if __name__ == '__main__':

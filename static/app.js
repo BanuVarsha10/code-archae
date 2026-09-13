@@ -200,7 +200,7 @@ async function explainFunction(name) {
     const data = await res.json();
 
     let groundingHtml = '';
-    const hasIssues = data.red_flag_severity || data.event_mismatches.length || data.hallucinated_issues.length;
+    const hasIssues = data.red_flag_severity || data.event_mismatches.length || data.hallucinated_issues.length || (data.connections_overclaims && data.connections_overclaims.length);
     if (hasIssues) {
       const parts = [];
       if (data.red_flag_severity) {
@@ -211,6 +211,9 @@ async function explainFunction(name) {
       }
       if (data.hallucinated_issues.length) {
         parts.push(`<div class="grounding-flag">Unverified issue citation(s): ${data.hallucinated_issues.map(n => '#' + n).join(', ')}</div>`);
+      }
+      if (data.connections_overclaims && data.connections_overclaims.length) {
+        parts.push(`<div class="grounding-flag">Overclaimed connection(s) detected: ${data.connections_overclaims.join(', ')}</div>`);
       }
       groundingHtml = `<div class="grounding-notes">${parts.join('')}</div>`;
     } else {

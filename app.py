@@ -89,12 +89,12 @@ def api_lifeline(name: str, repo: str):
 @app.post("/api/functions/{name}/explain")
 def api_explain(name: str, repo: str):
     conn = get_conn(repo)
-    explanation, red_flags, event_mismatches, hallucinated_issues, was_cached, generated_at = (
+    explanation, red_flags, event_mismatches, hallucinated_issues, connections_overclaims, was_cached, generated_at = (
         core.get_cached_or_generate(name, conn, repo)
     )
     total_flags = sum(red_flags.values()) if red_flags else 0
     severity = "severe" if total_flags > 10 else "moderate" if total_flags > 3 else ("minor" if total_flags else None)
-    if hallucinated_issues or event_mismatches:
+    if hallucinated_issues or event_mismatches or connections_overclaims:
         confidence = "low"
     elif severity == "severe":
         confidence = "low"
@@ -115,6 +115,7 @@ def api_explain(name: str, repo: str):
             for m in event_mismatches
         ],
         "hallucinated_issues": sorted(hallucinated_issues),
+        "connections_overclaims": connections_overclaims,
     }
 
 

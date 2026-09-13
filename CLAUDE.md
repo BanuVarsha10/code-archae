@@ -234,6 +234,112 @@ solve narrative fabrication in general. A claim using a word-form still
 missing from the dictionary, or no recognizable keyword at all, still
 slips through undetected.
 
+## Call graph ("Connections" feature)
+
+### Design journey — three iterations, two real bugs caught by testing on real code
+1. First attempt: matched ALL function calls (both bare `foo()` and `x.foo()`
+   attribute calls) by bare name against the known qualified-name set.
+   Found two real false positives by testing on actual httpx code, not by
+   inspection:
+   - `asyncio.sleep(...)` incorrectly resolved to an internal function also
+     named `sleep` (a test helper wrapper in tests/concurrency.py) purely
+     because the bare names coincided.
+   - `output.splitlines()` (Python's built-in str.splitlines) incorrectly
+     resolved to an internal helper function also named `splitlines`.
+2. Second attempt: added import-statement tracking to skip calls made
+   through a known imported module name (fixes the asyncio.sleep case).
+   Did NOT fix the splitlines case -- built-in type methods aren't imports,
+   so there's nothing to track them against without real type inference.
+3. FINAL, SHIPPED DESIGN: restrict resolution to ONLY `self.method()` /
+   `cls.method()` calls. This is the one pattern where we can be reasonably
+   confident we're looking at an actual internal method call rather than a
+   built-in or an arbitrary local variable's method. Eliminates both false
+   positive classes at once. The import-tracking code from attempt 2 was
+   abandoned as unnecessary once this shipped -- self/cls calls are never
+   made through an imported name anyway.
+
+### The real, honest cost of this scope
+On httpx: call sites dropped from 4,120 (matching any call) to 127
+(self/cls only) -- a 97% reduction. This is not a bug, it's the deliberate
+price of trustworthiness over coverage. We lose visibility into module-level
+functions calling each other and any call through a local variable holding
+an object of unknown type. Widening this properly would need real type
+inference (e.g. via a real type checker), a much bigger undertaking --
+explicitly out of scope, not attempted.
+
+### Measured ambiguity rate -- weighted by frequency, not just distinct names
+20% of distinct method names in httpx are ambiguous (shared by 2+ classes,
+e.g. __init__, close). But weighted by actual call frequency, ~56% of
+RESOLVED calls are ambiguous (e.g. `send`, `sync_auth_flow` are both common
+AND ambiguous, since httpx has parallel sync/async classes with identical
+method names). Naive distinct-name counting significantly understated the
+real-world ambiguity rate.
+
+### Ambiguous calls are stored honestly, never resolved arbitrarily
+call_graph table: caller_qualified_name, callee_bare_name,
+resolved_qualified_name (NULL if ambiguous), is_ambiguous, candidates
+(JSON list, populated only if ambiguous). format_call_context() in
+build_call_graph.py renders both confident and ambiguous relationships
+explicitly, e.g. "calls send() -- ambiguous, could be:
+ASGITransport.send, AsyncClient.send, Client.send" -- never picks one.
+
+### Critical caveat, stated in the data AND the system prompt
+"No calls detected" must never be read as "calls nothing" -- it means
+"nothing detectable via our narrow self/cls-only method." This is baked
+into format_call_context()'s output text itself (not just the prompt),
+since the prompt instruction alone was NOT sufficient (see below).
+
+### 5th deterministic check: check_connections_overclaim -- a real failure caught on the FIRST live test
+The very first real generation with the new three-section prompt directly
+violated the explicit "never say no callers/calls nothing" instruction:
+generated text included "the function is not called by any other
+function... The function calls no other functions." Telling the model the
+data was incomplete did not stop it from drawing the forbidden conclusion.
+None of the four existing checks caught this (it's a new failure category,
+not a hash/issue/event-type/hedge-language problem).
+FIX: check_connections_overclaim() scans for a list of overclaim phrases
+("not called by any", "calls no other", "has no callers", "is unused",
+etc.) and forces confidence to "low" if any appear (this is a direct
+contradiction of provided data, not just a hedge risk -- treated more
+severely than the red-flag phrase scan).
+VERIFIED PROPERLY: a live regeneration came back clean (connections_overclaims:
+[]), but this was correctly NOT trusted as proof on its own, since local LLM
+generation is non-deterministic and the model might have simply phrased
+things differently that run. The check was separately verified by feeding
+it the EXACT literal violating sentences from the failed run -- confirmed
+it correctly returns all three matched phrases. This is the same "test
+against the known-bad case directly, don't trust a clean non-deterministic
+rerun" discipline used for the check_event_type_consistency clause-splitting
+fix earlier.
+Also worth noting: the hasIssues gate in app.js had to be extended to
+include connections_overclaims -- without that, an overclaim-only response
+would have silently rendered "passed all checks" instead of the flag, which
+is worse than having no check at all (confidently wrong AND visibly marked
+clean).
+
+## Commit attribution hardening
+~/.claude/settings.json now sets "attribution": {"commit": "", "pr": ""}
+to suppress Claude Code's default commit trailers. This alone was not
+fully trusted, since Anthropic's own docs note inconsistent enforcement
+across invocation paths -- added a belt-and-suspenders git hook as a
+guaranteed fallback: .githooks/commit-msg (wired via core.hooksPath),
+strips both the Co-Authored-By line and the "Generated with Claude Code"
+line regardless of what the settings.json does. REAL BUG caught during
+setup: the hook's original pattern matched the emoji-prefixed line via
+the literal 🤖 byte sequence embedded in the shell script -- this worked
+when the script was run manually but silently failed when git itself
+spawned the hook (the Co-Authored-By line was stripped correctly, the
+emoji line was not) -- some encoding/locale difference in how the
+process was invoked. FIX: match on the ASCII trailer text instead of the
+emoji, sidestepping the encoding dependency entirely. Verified against
+real `git commit` invocations (not just manual script runs) before
+trusting it, since manual testing was exactly what had been giving a
+false sense of confidence.
+Full history cleanup (removing Claude co-authorship from PAST commits,
+before this fix existed) is still deliberately deferred to end-of-project,
+per an earlier explicit decision -- this fix only stops the problem from
+growing further, it doesn't retroactively fix already-pushed commits.
+
 ## Files built so far
 - explore.py, explore_ast.py — early proof-of-concept scripts (Phase 1-2)
 - match_functions.py — standalone matcher demo
@@ -251,6 +357,8 @@ slips through undetected.
   listing/search, lifeline + explain endpoints, and
   /api/repos/{repo_key}/tree (file-tree view grouping function_events by
   file_path and qualified_name).
+- build_call_graph.py -- AST-based call-graph extraction (self/cls calls
+  only) and resolution, with honest handling of ambiguous matches
 
 ## What's NOT built yet
 - Any CLI beyond `python explain.py <function_name>` — no way to list or
@@ -272,3 +380,13 @@ slips through undetected.
   gitignored. Never hardcode credentials.
 - When debugging a claim about real data, always query the CURRENT
   archaeologist.db directly rather than trusting memory of a prior session.
+
+## Status: Phase A complete
+Everything through multi-repo support, the file tree view, the
+code-explanation feature (What it does / Connections / History), and all
+five deterministic grounding checks is built and verified against real
+data, not just written and assumed correct. NEXT: Phase B (embeddings +
+retrieval) -- the actual prerequisite for free-form Q&A, since the current
+system only ever explains ONE function you already know the name of; a
+real chatbot needs to find WHICH functions are relevant to an arbitrary
+question first.
