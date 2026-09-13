@@ -317,6 +317,88 @@ would have silently rendered "passed all checks" instead of the flag, which
 is worse than having no check at all (confidently wrong AND visibly marked
 clean).
 
+## Phase B: embeddings + retrieval
+
+### Environment bugs fixed before this would even run (not code issues)
+1. Stale msvcp140.dll (v14.27, ~2020) bundled directly in C:\Anaconda3\
+   shadowed the newer, compatible System32 copy (v14.50) due to Windows'
+   DLL search order (exe's own directory searched before System32) --
+   crashed torch on import with an access violation. FIX: reinstalled
+   torch via `conda install pytorch cpuonly -c pytorch`, which pulls a
+   matched runtime rather than relying on the stale colocated DLL.
+2. That surfaced a second, well-known issue: duplicate OpenMP runtime
+   conflict between numpy's MKL and torch's bundled OpenMP. FIX: standard
+   `KMP_DUPLICATE_LIB_OK=TRUE` environment variable workaround.
+Both confirmed via real evidence (Windows Event Viewer crash logs showing
+the exact faulting DLL) before acting, not guessed at.
+
+### Model choice: sentence-transformers (all-MiniLM-L6-v2), not Ollama
+Deliberate choice for THIS piece specifically, unlike the rest of the
+project: pure Python library, no separate server process, so it could be
+verified directly rather than only ever testable on the Windows machine
+(the same limitation that applied to every Ollama-dependent feature).
+Also the same model family already used in the FinSage project.
+
+### Critical design finding: current-HEAD-only embedding contradicts the project's own premise
+First version embedded only each function's CURRENT source (via the same
+get_current_source logic as the explanation feature). Measured against
+real queries: "authentication" and "redirect handling" worked well
+(0.38-0.42 similarity, genuinely on-topic). "Connection pooling" scored
+weakly (0.20-0.32, unrelated header tests) -- traced precisely, not
+assumed: the real ConnectionPool/ConnectionStore implementation classes
+from an earlier httpx architecture era no longer exist at the current
+checkout, so they were never embedded at all. This is a coverage gap,
+not an embedding-quality problem -- and it directly undermines the
+project's actual purpose (explaining history, not just current state) if
+left unaddressed.
+FIX: for functions with no current source (deleted, refactored away,
+superseded), fall back to embedding constructed text: the qualified name
++ every file path it ever lived at + every commit message associated
+with its changes. Verified: "connection pooling and reuse" jumped from
+0.20-0.32 (wrong functions) to 0.52-0.59 (ConnectionStore.__getitem__,
+ConnectionPool.acquire_connection, ConnectionPool.release_connection --
+the actual real implementation, correctly tagged [historical_metadata]).
+970 of 970 functions now embedded (191 current_code, 779
+historical_metadata), versus 191 of 970 before the fix.
+
+### Real migration bug hit and fixed (schema drift between sessions)
+function_embeddings already existed from an earlier test run with a
+2-column schema (no source_type column). CREATE TABLE IF NOT EXISTS is a
+no-op against an already-existing table, so the new 3-column INSERT
+failed with a column-count mismatch. FIX: ALTER TABLE ADD COLUMN
+migration check, mirroring the identical pattern already used in cli.py's
+get_cached_or_generate for the explanations table -- same category of
+bug, same established fix pattern, correctly recognized and reapplied
+rather than treated as new.
+
+### Non-obvious finding, deliberately NOT patched -- documented instead
+historical_metadata text is keyword-dense (bare name + file paths + real
+commit messages, no code noise) and can OUT-SCORE current_code embeddings
+even for queries where current code exists and works fine (e.g. auth,
+redirect test functions scored lower than historical_metadata hits on
+the same topics). This is NOT a bug -- similarity score answers "is this
+topically relevant" and is answering it correctly either way.
+DELIBERATELY NOT FIXED: a naive "prefer current_code when both exist"
+tie-breaker would override a working signal to serve a concern (richer
+explanations) that belongs to a different layer entirely.
+WHERE THIS ACTUALLY NEEDS HANDLING: Phase C's explanation-generation step,
+not retrieval. A retrieved current_code hit can get a real "what it does"
+description; a historical_metadata hit has no live code to describe --
+the honest response is "no longer exists in the current codebase, here is
+what's tracked about its history," not a fabricated code description.
+Revisit the retrieval-level question only if real usage in Phase C shows
+this actually causing problems -- don't preemptively patch a working
+signal based on a single test session's queries.
+
+## Status: Phase B complete
+Retrieval works, verified against real, deliberately adversarial test
+queries (not just easy ones) across both current-code and historical-only
+functions. NEXT: Phase C -- the chatbot itself. Needs its own grounding
+discipline from day one: retrieved historical_metadata hits must never be
+described as if they were live code, and the same five-check grounding
+discipline from the single-function explanation feature applies here too,
+likely needing extension for multi-function context.
+
 ## Commit attribution hardening
 ~/.claude/settings.json now sets "attribution": {"commit": "", "pr": ""}
 to suppress Claude Code's default commit trailers. This alone was not
