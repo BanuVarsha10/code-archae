@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn==0.52.4
+PyDriller==2.11
+numpy==1.24.3
+scipy==1.11.1
+requests==2.32.5
+python-dotenv==0.21.0
+filelock==3.9.0
+sentence-transformers==5.1.2
+groq==1.7.0

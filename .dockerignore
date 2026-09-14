@@ -1,0 +1,14 @@
+**/.git
+repos/banuvarsha10_fin-rag_genai/content
+archaeologist.db
+test_httpx_embed.db
+__pycache__
+*.pyc
+.env
+uvicorn*.log
+server.log
+*.tex
+*.aux
+resume*
+.githooks
+node_modules

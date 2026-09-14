@@ -159,18 +159,20 @@ def answer_question(query, conn, repo_key, model='llama3.2:3b', top_k=5):
 
     full_context = '\n\n---\n\n'.join(context_blocks)
 
-    import ollama
-    response = ollama.chat(
-        model=model,
-        messages=[
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': f"User's question: {query}\n\nRetrieved functions:\n\n{full_context}"}
-        ]
-    )
-    raw_answer = response['message']['content']
+    import llm_backend
+    raw_answer = llm_backend.llm_chat([
+        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'user', 'content': f"User's question: {query}\n\nRetrieved functions:\n\n{full_context}"}
+    ], model=model)
 
     cited_hashes = set(re.findall(r'\b[0-9a-f]{6,8}\b', raw_answer))
-    hallucinated_hashes = cited_hashes - all_valid_hashes
+    hallucinated_hashes = set()
+    for h in cited_hashes:
+        if h in all_valid_hashes:
+            continue
+        if h.zfill(8) in all_valid_hashes:
+            continue  # malformed-but-real: dropped leading zero, same fix cli.py already has
+        hallucinated_hashes.add(h)
 
     cited_issues = set(int(n) for n in re.findall(r'#(\d+)', raw_answer))
     hallucinated_issues = cited_issues - all_valid_issues

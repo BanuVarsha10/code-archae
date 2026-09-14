@@ -80,6 +80,12 @@ confirmBtn.addEventListener('click', async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ repo_url: url })
   });
+  if (res.status === 403) {
+    const err = await res.json();
+    indexingStatus.innerHTML = `<div class="stage-error">${err.detail}</div>`;
+    confirmBtn.disabled = false;
+    return;
+  }
   const data = await res.json();
   const repoKey = data.repo_key;
   indexingStatus.innerHTML = `<div class="stage-active">Starting…</div>`;

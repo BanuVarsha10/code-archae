@@ -710,3 +710,96 @@ retrieval) -- the actual prerequisite for free-form Q&A, since the current
 system only ever explains ONE function you already know the name of; a
 real chatbot needs to find WHICH functions are relevant to an arbitrary
 question first.
+
+## Groq backend + deployment (tonight's second half)
+
+### Dual LLM backend: llm_backend.py
+Single shared module (llm_chat()) used by both cli.py and ask.py,
+routing to either local Ollama (default) or Groq's API
+(LLM_BACKEND=groq, used for the deployed version, which has no local
+GPU). load_dotenv() lives inside llm_backend.py itself, not per-caller
+-- verified via direct test that load_dotenv() does NOT override
+already-set environment variables, making this safe for both local
+(.env-based) and deployed (platform-injected) environments with zero
+conditional logic needed. Model for the Groq path: openai/gpt-oss-20b --
+Groq's own current recommended replacement for llama-3.1-8b-instant,
+which they deprecated for free/developer tier usage on 2026-06-17
+(verified via Groq's own docs before hardcoding a model name that could
+already have been dead).
+
+### Deployment saga: Hugging Face Spaces pivot to Render
+Original plan was Hugging Face Spaces (Docker SDK, believed free). REAL,
+RECENT POLICY CHANGE discovered live: HF's own current docs state Docker
+Spaces require a paid plan to create -- confirmed via multiple July 2026
+forum threads reporting the identical surprise with no changelog or
+announcement. Pivoted to Render (confirmed current and genuinely free:
+750 instance-hours/month, no credit card, free services sleep after 15
+min inactivity with ~1min cold-start on next request). The Dockerfile
+itself needed ZERO changes between platforms -- confirming the earlier
+"bake data into the image, no live writes" architecture decision was
+sound regardless of which platform ended up hosting it.
+
+### The deploy-repo problem: gitignored data needs its own repo
+Both platforms build from a connected git repo -- but *.db files and
+repos/ are gitignored in the main repo (intentionally, to keep it from
+bloating with generated data). Docker's local COPY . . doesn't care
+about .gitignore (only .dockerignore), so the local build worked fine;
+a platform building FROM GIT gets none of the baked-in data that way.
+FIX: a completely separate staging directory (../code-archae-deploy,
+NOT a branch or gitignore override in the main repo) with curated data
+physically copied in, and .git/content/ genuinely deleted from disk
+(not just excluded) before committing -- necessary because git treats
+nested .git directories specially, and force-adding them risks real
+corruption, not just clutter.
+
+### Two real missing-file bugs, both caught only by running a real container
+1. build_call_graph.py was never copied into staging -- cli.py's
+   top-level `import build_call_graph` crashed the container immediately
+   on startup.
+2. repos.json was never copied -- silently broke every API request
+   (get_conn() 404s on everything), invisible to an import-based check
+   by design, since repos.json is read via plain file I/O
+   (json.load(open(...))), never imported. Same category of lesson as
+   several earlier findings tonight (the pip freeze regex miss, the
+   docker build | tee exit-code trap): a check is only as complete as
+   the category of failure it was built to look for.
+Both confirmed fixed via the strongest available test: a live curl POST
+to /api/ask on the real deployed container, touching embeddings, Groq,
+and every grounding check at once -- not a narrower per-symptom test.
+
+### Public indexing disabled by design, not oversight
+DISABLE_LIVE_INDEXING=true (deployed only) gates POST /api/repos behind
+a 403 with a clear, honest message. Reasoning: Render's free tier is 0.1
+CPU / 512MB RAM with NO persistent disk -- a live indexing job would be
+slow at best, and anything it produced would vanish on the next
+restart, which is worse than an honest refusal. There's also a real
+public-abuse angle once a URL is live and shared. Documented in the
+main repo's README with the reasoning stated plainly.
+
+### PR-anchored timeline redesign (cli.py) -- removed a whole field from the LLM's reach
+generate_explanation's "History" section is no longer LLM-generated.
+build_pr_anchored_timeline() builds it deterministically, quoting real
+linked PR/issue titles DIRECTLY from the issues table, or stating
+plainly that no link exists -- never paraphrased or invented. This isn't
+a formatting change: it permanently removes a whole field from the
+LLM's attack surface rather than generating-then-checking it after the
+fact. Verified: every quoted PR title in a test run matched the real
+issues table byte-for-byte.
+
+### Real regression found and fixed: ask.py's hash checker missing a fix cli.py already had
+Live production test surfaced a false positive on a real commit hash
+with a dropped leading zero -- the exact "malformed but real" pattern
+cli.py's checker already special-cases. ask.py's checker never
+inherited that fix. Fixed with the identical zfill(8) reconciliation
+logic. Verified live against the actual deployed instance, not just
+locally.
+
+## Status: deployed and live
+Public URL: https://code-archaeologist-deploy.onrender.com -- confirmed
+working end-to-end via direct curl to production, including the full
+/api/ask path (embeddings + Groq + all checks), not just a health
+check. Main repo (github.com/BanuVarsha10/code-archae) and the deploy
+repo (github.com/BanuVarsha10/code-archaeologist-deploy) are kept
+intentionally separate -- the former is the real, documented source,
+the latter a generated build artifact regenerated from it, not an
+independently maintained codebase.

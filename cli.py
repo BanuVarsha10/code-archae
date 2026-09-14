@@ -1,5 +1,4 @@
 import sqlite3, re, sys, os, datetime, json, ast
-import ollama
 import build_call_graph
 
 conn = sqlite3.connect('archaeologist.db')
@@ -163,6 +162,51 @@ def get_current_source(repo_key, qualified_name, conn):
     ff = SourceFF(source); ff.visit(tree)
     return ff.functions.get(qualified_name), file_path
 
+def build_pr_anchored_timeline(name, events, conn):
+    def get_linked_issue(event):
+        m = pattern.search(event['message'])
+        if not m:
+            return None, None
+        num = int(m.group(1))
+        row = conn.execute('SELECT title FROM issues WHERE number = ?', (num,)).fetchone()
+        return (num, row['title']) if row else (None, None)
+
+    if not events:
+        return 'No tracked history found.'
+
+    lines = []
+    first = events[0]
+    lines.append('Function introduced:')
+    issue_num, issue_title = get_linked_issue(first)
+    header = f"  {first['date'][:10]} (commit {first['commit_hash'][:8]})"
+    if issue_num:
+        header += f', PR #{issue_num}'
+    lines.append(header)
+    if issue_title:
+        lines.append(f'  Reason (from PR #{issue_num} title): "{issue_title}"')
+    else:
+        lines.append('  Reason: not captured in the available data (no linked PR/issue title)')
+
+    evolution = []
+    for e in events[1:]:
+        num, title = get_linked_issue(e)
+        if title:
+            evolution.append((e, num, title))
+
+    if evolution:
+        lines.append('')
+        lines.append('Major evolution (PR-linked changes):')
+        for e, num, title in evolution:
+            lines.append(f'  PR #{num}: "{title}" ({e["date"][:10]}, {e["event_type"]})')
+
+    unlinked = len(events) - 1 - len(evolution)
+    if unlinked > 0:
+        lines.append('')
+        lines.append(f'({unlinked} additional modification(s) with no linked PR/issue -- reason not captured for these.)')
+
+    return '\n'.join(lines)
+
+
 def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
     events = get_lifeline(name, conn)
     if not events:
@@ -174,7 +218,7 @@ def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
     call_context = build_call_graph.format_call_context(name, conn)
     context += f"\n\n{call_context}"
     system_prompt = (
-        "You have three separate tasks -- keep them clearly apart in your answer.\n\n"
+        "You have two separate tasks -- keep them clearly apart in your answer.\n\n"
         "TASK 1 -- WHAT IT DOES: given the function's current source code "
         "(provided below, if available), explain what it does mechanically. "
         "Walk through the actual logic, grounded strictly in the literal code "
@@ -186,25 +230,16 @@ def generate_explanation(name, conn, repo_key, model='llama3.2:3b'):
         "'calls nothing', or 'is unused' just because the list is short or "
         "empty. For ambiguous relationships, state the ambiguity and list "
         "the real candidates -- do not pick one arbitrarily.\n\n"
-        "TASK 3 -- HISTORY: explain why this function exists and how it "
-        "evolved, using ONLY the structured history provided below. Do NOT "
-        "use words like 'likely', 'probably', 'this suggests', 'aimed to', "
-        "or any language implying motivation not explicitly stated in a PR "
-        "title. If a PR title does not explain why a change was made, say "
-        "plainly that the reason is not captured, rather than guessing. "
-        "Cite specific commit hashes for claims where relevant. Do not "
-        "invent commit hashes that are not in the data.\n\n"
-        "Structure your response as three sections: 'What it does', "
-        "'Connections', and 'History'."
+        "Structure your response as two sections: 'What it does' and "
+        "'Connections'."
     )
-    response = ollama.chat(
-        model='llama3.2:3b',
-        messages=[
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"Explain the history of this function:\n\n{context}"}
-        ]
-    )
-    explanation = response['message']['content']
+    import llm_backend
+    explanation = llm_backend.llm_chat([
+        {'role': 'system', 'content': system_prompt},
+        {'role': 'user', 'content': f"Explain the history of this function:\n\n{context}"}
+    ], model=model)
+    pr_timeline = build_pr_anchored_timeline(name, events, conn)
+    explanation = explanation + "\n\n## History (grounded, no LLM involved in this section)\n\n" + pr_timeline
     red_flags = scan_red_flags(explanation)
     cited_issues = set(int(n) for n in re.findall(r'#(\d+)', explanation))
     hallucinated_issues = cited_issues - valid_issue_numbers

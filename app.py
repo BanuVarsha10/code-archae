@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sqlite3
 from fastapi import FastAPI, Query, HTTPException, Body
@@ -28,6 +29,13 @@ def get_conn(repo_key: str):
 
 @app.post("/api/repos")
 def api_add_repo(body: dict):
+    if os.environ.get("DISABLE_LIVE_INDEXING") == "true":
+        raise HTTPException(
+            status_code=403,
+            detail="Live indexing is disabled on this public deployment. "
+                   "This demo runs against a fixed set of pre-indexed repos. "
+                   "To index your own repo, run this project locally -- see the GitHub README."
+        )
     repo_url = body["repo_url"]
     max_commits = body.get("max_commits", 450)
     repo_key = registry.repo_key_from_url(repo_url)
