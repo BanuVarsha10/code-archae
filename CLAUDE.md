@@ -399,6 +399,135 @@ described as if they were live code, and the same five-check grounding
 discipline from the single-function explanation feature applies here too,
 likely needing extension for multi-function context.
 
+## Phase C: free-form Q&A (ask.py) -- in progress
+
+### Architecture: built entirely from existing infrastructure, nothing reinvented
+ask.py combines, in order: build_embeddings.search() (Phase B retrieval,
+top-K functions for a query) -> a context-assembly step per retrieved
+function reusing cli.py's get_lifeline/format_lifeline_context and
+build_embeddings.get_current_source unchanged -> one LLM synthesis call
+across all retrieved functions -> six grounding checks (three reused
+directly from the single-function explainer, three new to this phase).
+
+### Three NEW failure modes identified before writing any code, specific to multi-function synthesis
+Single-function explanation never had to guard against these:
+1. Cross-function misattribution -- a fact true about function A gets
+   stated as if about function B, now that both share one prompt.
+2. Forced relevance -- weakly-relevant retrieved functions get force-
+   connected to the question instead of honestly flagged as unrelated.
+3. Invented relationships -- claiming two functions were "changed
+   together" or "A calls B" with nothing in the data supporting it.
+
+### check_cross_function_attribution: THREE real bugs found across three rounds, each a genuinely different lesson
+1. **1:1 hash-ownership assumption (wrong data model).** First version
+   built hash_to_true_function as a dict -- one hash, one "true" owner.
+   Real DB verification (not assumption) showed this is false by this
+   project's own design: a rename commit legitimately produces an event
+   for BOTH the old and new qualified name, and an ordinary commit
+   touching multiple functions at once is completely normal. Any
+   legitimate second citation of a shared hash got falsely flagged.
+   FIX: hash_to_valid_functions as hash -> SET of legitimate owners: a
+   citation is only flagged if the claimed function is NOT in that set.
+   Verified: the exact real false-positive case (Connection._release /
+   Connection._body_iter sharing rename-commit hashes) now returns
+   empty, while a synthetic genuine cross-function error (a hash cited
+   under a function with zero real relationship to it) is still caught.
+2. **Exact-match header parsing (fragile to model formatting drift).**
+   Checker required the section header text to exactly equal a known
+   qualified name. A live run produced headers like
+   "### FunctionPoolManager.__init__" (model concatenated "Function"
+   directly onto the real name, no space) -- this never exactly equals
+   "PoolManager.__init__", so ANY hash cited under that header would be
+   compared against the wrong "true" owner and falsely flagged, even a
+   100% correct citation.
+   FIX: match by substring containment instead of exact equality -- a
+   mangled header still CONTAINS the real name. Verified two ways: (a)
+   confirmed the real mangled-header run had zero hash citations, so it
+   alone couldn't prove anything either way; (b) directly injected a
+   known-real hash under the exact mangled header text and ran BOTH the
+   old and new logic side by side -- old logic: "WOULD FALSELY FLAG"
+   (confirmed), new logic: correctly clean. Proved the fix rather than
+   waiting to get lucky on a live rerun.
+3. **Silent no-op when the model skips the section-header format
+   entirely.** If the model writes plain prose instead of "###
+   FunctionName" sections, the original checker had nothing to split on
+   and silently returned an empty list -- indistinguishable from "checked
+   and clean." FIX: return a third value (or in the earliest version, a
+   tuple) explicitly signaling structure_checked=False when no headers
+   are found at all, so "couldn't verify" is visibly different from
+   "verified and clean." Also extended: a header that doesn't match ANY
+   retrieved function name at all now surfaces as its own
+   unrecognized_headers signal, rather than being silently absorbed
+   either as a pass or a guessed match.
+Same underlying lesson across all three, worth remembering for future
+checks: when a check depends on the model following an exact format or
+a clean data model, build in tolerance for drift from day one -- these
+were all found live, not anticipated in advance, meaning the first
+version of a new check should be treated as a hypothesis to stress-test
+against real generations, not a finished tool.
+
+### check_retrieval_overreach: pattern-chasing abandoned in favor of a deterministic disclaimer, mid-project
+Round 1: caught 0 of 4 real "Overall, this doesn't answer the question"
+verdict sentences across a live batch -- each defeated by a DIFFERENT
+real cause (missing vocabulary, wrong verb inflection: "do" vs "does",
+apostrophe breaking word-boundary matching). Two rounds of vocabulary
+widening improved this to 3 of 4, but the pattern kept finding new ways
+to almost work rather than converging -- the space of natural-language
+paraphrases for "this doesn't tell us that" is effectively unbounded,
+making this structurally a harder problem than the concrete-fact checks
+(hash exists, event type matches) that work well elsewhere in this
+project. This is the same category of limitation that motivated
+abandoning the LLM-judge approach back in Phase A -- except here it
+showed up in a DETERMINISTIC keyword check, proving the lesson
+generalizes: it's not really "LLM judgment is unreliable," it's
+"open-ended semantic pattern-matching in natural language is hard,
+regardless of which tool tries to do it."
+DECISION: stopped patching the detector and made the underlying fact
+structurally unconditional instead. DISCLAIMER_TEMPLATE is appended in
+code, not generated by the model, and is NOT conditional on any check
+passing or failing -- it always states "this answer is based on N of
+TOTAL functions; absence from these N doesn't mean absence from the
+codebase." Verified 100% reliable across 12 total live runs (three
+separate 4x batches) -- exact counts, every time, because it's plain
+string formatting with no model variance to fail. check_retrieval_overreach
+is KEPT as a secondary, best-effort signal (now catching 3 of 4 real
+cases after widening), but is explicitly no longer the primary safeguard
+for this risk.
+
+### Real ordering bug found and fixed: the disclaimer was contaminating its own grounding check
+After adding the disclaimer, it was appended to `answer` BEFORE the
+grounding checks ran -- so check_retrieval_overreach scanned its own
+disclaimer text ("does not mean it does not exist... in the codebase")
+and flagged it as a violation on every single run, since it shares
+vocabulary with the real violation pattern despite saying the opposite
+(the correct caveat, not an overreach). FIX: checks now run against
+raw_answer (the model's untouched output); the disclaimer is appended
+only to the copy returned to the caller, after all checks complete.
+Verified: re-ran the same 4x batch, confirmed the disclaimer's own
+sentence no longer appears in retrieval_overreach in any run, while
+genuine model-generated overreach claims are still caught correctly.
+
+### Current check inventory for ask.py (6 total, 3 reused + 3 new)
+Reused unchanged from the single-function explainer: hash citation
+check, issue citation check, red-flag phrase scan.
+New to Phase C: check_cross_function_attribution (3 real bugs fixed, see
+above), check_retrieval_overreach (demoted to secondary signal, see
+above), plus the always-on deterministic disclaimer (not a "check" in
+the traditional sense -- a structural guarantee that needs no detection
+logic at all).
+
+## Status: Phase C in progress
+ask.py works end-to-end against real repos with real, verified grounding.
+Extensively tested against ONE deliberately adversarial query
+("how does connection pooling work" -- chosen because the honest answer
+is "the real implementation is historical, not current," making it a
+good stress test for exactly the failure modes this phase needed to
+catch). NOT yet tested against a different question shape, and NOT yet
+wired into the web UI -- still CLI-only (`python ask.py <repo_key>
+<question>`). Diminishing returns are visible on further iteration of
+this same query; the next real learning will likely come from testing a
+structurally different kind of question, not a fifth round on this one.
+
 ## Commit attribution hardening
 ~/.claude/settings.json now sets "attribution": {"commit": "", "pr": ""}
 to suppress Claude Code's default commit trailers. This alone was not
