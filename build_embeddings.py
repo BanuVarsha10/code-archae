@@ -1,4 +1,4 @@
-import sqlite3, os, ast, pickle
+import sqlite3, os, ast, pickle, re
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -64,10 +64,12 @@ def build_fallback_text(qualified_name, conn):
 
 def build_embeddings(repo_key, conn):
     conn.execute('''CREATE TABLE IF NOT EXISTS function_embeddings (
-        qualified_name TEXT PRIMARY KEY, embedding BLOB, source_type TEXT)''')
+        qualified_name TEXT PRIMARY KEY, embedding BLOB, source_type TEXT, content TEXT)''')
     existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(function_embeddings)').fetchall()}
     if 'source_type' not in existing_cols:
         conn.execute('ALTER TABLE function_embeddings ADD COLUMN source_type TEXT')
+    if 'content' not in existing_cols:
+        conn.execute('ALTER TABLE function_embeddings ADD COLUMN content TEXT')
     conn.execute('DELETE FROM function_embeddings')
 
     names = [r[0] for r in conn.execute('SELECT DISTINCT qualified_name FROM function_events')]
@@ -82,7 +84,7 @@ def build_embeddings(repo_key, conn):
             skipped += 1
             continue
         embedding = model.encode(text)
-        conn.execute('INSERT INTO function_embeddings VALUES (?, ?, ?)',
+        conn.execute('INSERT INTO function_embeddings (qualified_name, embedding, source_type) VALUES (?, ?, ?)',
                       (name, pickle.dumps(embedding), source_type))
         if source_type == 'current_code':
             source_count += 1
@@ -90,6 +92,104 @@ def build_embeddings(repo_key, conn):
             fallback_count += 1
     conn.commit()
     return source_count, fallback_count, skipped, len(names)
+
+
+def chunk_readme(repo_dir):
+    readme_names = ['README.md', 'README.rst', 'README.txt', 'readme.md']
+    readme_path = None
+    for name in readme_names:
+        candidate = os.path.join(repo_dir, name)
+        if os.path.exists(candidate):
+            readme_path = candidate
+            break
+    if not readme_path:
+        return []
+
+    with open(readme_path, 'r', encoding='utf-8', errors='replace') as f:
+        content = f.read()
+
+    content = re.sub(r'<[^>]+>', ' ', content)
+    content = re.sub(r'```.*?```', ' ', content, flags=re.DOTALL)
+
+    parts = re.split(r'(?=^## )', content, flags=re.MULTILINE)
+    chunks = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith('## '):
+            title = part.split('\n', 1)[0][3:].strip()
+            body = part.split('\n', 1)[1].strip() if '\n' in part else ''
+        else:
+            title = 'Overview'
+            body = part
+        body = re.sub(r'\n{2,}', ' ', body).strip()
+        body = re.sub(r'\s{2,}', ' ', body).strip()
+        if body:
+            chunks.append((title, body))
+    return chunks
+
+
+def build_doc_embeddings(repo_key, conn):
+    chunks = chunk_readme(f'repos/{repo_key}')
+    count = 0
+    for title, body in chunks:
+        qualified_name = f'README: {title}'
+        embedding = model.encode(body)
+        conn.execute(
+            'INSERT OR REPLACE INTO function_embeddings VALUES (?, ?, ?, ?)',
+            (qualified_name, pickle.dumps(embedding), 'documentation', body)
+        )
+        count += 1
+    conn.commit()
+    return count
+
+
+def extract_module_docstrings(repo_dir):
+    docstrings = []
+    for root, dirs, files in os.walk(repo_dir):
+        if '.git' in dirs:
+            dirs.remove('.git')
+        for fname in files:
+            if not fname.endswith('.py'):
+                continue
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, repo_dir).replace('\\', '/')
+            try:
+                with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                    source = f.read()
+                doc = ast.get_docstring(ast.parse(source))
+                if doc and len(doc.strip()) > 20:
+                    docstrings.append((rel_path, doc.strip()))
+            except SyntaxError:
+                continue
+    return docstrings
+
+
+def build_structural_summary(repo_dir, conn):
+    files = []
+    for root, dirs, filenames in os.walk(repo_dir):
+        if '.git' in dirs:
+            dirs.remove('.git')
+        for fname in filenames:
+            if fname.endswith('.py'):
+                files.append(os.path.relpath(os.path.join(root, fname), repo_dir).replace('\\', '/'))
+
+    most_called = conn.execute('''SELECT resolved_qualified_name, COUNT(DISTINCT caller_qualified_name) c
+        FROM call_graph WHERE resolved_qualified_name IS NOT NULL
+        GROUP BY resolved_qualified_name ORDER BY c DESC LIMIT 5''').fetchall()
+
+    parts = [f'This project contains {len(files)} Python files, including: {", ".join(sorted(files)[:15])}.']
+    if most_called:
+        desc = ', '.join(f'{r[0]} (called by {r[1]} other function(s))' for r in most_called)
+        parts.append(f'The most central functions, by how many other functions call them, are: {desc}.')
+
+    docs = extract_module_docstrings(repo_dir)
+    if docs:
+        doc_text = ' '.join(f'{path}: "{d[:150]}"' for path, d in docs[:5])
+        parts.append(f'Real module docstrings found in the code: {doc_text}')
+
+    return ' '.join(parts)
 
 
 def search(query, conn, top_k=5):
@@ -112,6 +212,22 @@ if __name__ == '__main__':
     source_count, fallback_count, skipped, total = build_embeddings(repo_key, conn)
     print(f'{total} distinct functions: {source_count} embedded from current code, '
           f'{fallback_count} embedded from historical metadata (fallback), {skipped} skipped entirely')
+
+    doc_count = build_doc_embeddings(repo_key, conn)
+    if doc_count > 0:
+        print(f'Also embedded {doc_count} README sections as documentation')
+    else:
+        # No README found -- fall back to a deterministic structural
+        # summary instead, clearly labeled as auto-generated so it's
+        # never mistaken for human-written project documentation.
+        summary = build_structural_summary(f'repos/{repo_key}', conn)
+        conn.execute(
+            'INSERT OR REPLACE INTO function_embeddings VALUES (?, ?, ?, ?)',
+            ('Project Structure (auto-generated -- no README found)',
+             pickle.dumps(model.encode(summary)), 'structural_summary', summary)
+        )
+        conn.commit()
+        print('No README found -- embedded an auto-generated structural summary instead')
 
     print()
     print('Test queries:')

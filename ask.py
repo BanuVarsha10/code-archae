@@ -12,6 +12,22 @@ DISCLAIMER_TEMPLATE = (
 
 
 def build_function_block(qualified_name, sim_score, conn, repo_key):
+    row = conn.execute(
+        'SELECT source_type, content FROM function_embeddings WHERE qualified_name = ?',
+        (qualified_name,)
+    ).fetchone()
+    stored_type = row['source_type'] if row else None
+
+    if stored_type == 'documentation':
+        lines = [f'### {qualified_name}  (relevance: {sim_score:.2f}, type: documentation)']
+        lines.append(f'README content:\n{row["content"]}')
+        return '\n'.join(lines), set(), set()
+
+    if stored_type == 'structural_summary':
+        lines = [f'### {qualified_name}  (relevance: {sim_score:.2f}, type: structural_summary)']
+        lines.append(f'Auto-generated from code structure (NOT a README -- no human-written project description exists for this repo):\n{row["content"]}')
+        return '\n'.join(lines), set(), set()
+
     source = be.get_current_source(qualified_name, conn, f'repos/{repo_key}')
     source_type = 'current_code' if source else 'historical_metadata'
     lines = [f'### {qualified_name}  (relevance: {sim_score:.2f}, type: {source_type})']
@@ -79,6 +95,15 @@ def check_retrieval_overreach(explanation, retrieved_function_names):
     return flagged
 
 
+def check_omitted_functions(explanation, retrieved_function_names):
+    omitted = []
+    for name in retrieved_function_names:
+        pattern = r'(?<!\w)' + re.escape(name) + r'(?!\w)'
+        if not re.search(pattern, explanation):
+            omitted.append(name)
+    return omitted
+
+
 SYSTEM_PROMPT = (
     "You answer a user's question about a codebase's history using ONLY "
     "the retrieved function data provided below. Each function is labeled "
@@ -86,7 +111,14 @@ SYSTEM_PROMPT = (
     "source is shown) or historical_metadata (this function no longer "
     "exists in the codebase; only its tracked name, file history, and "
     "commit messages are known -- NEVER describe historical_metadata "
-    "functions as if you can see their actual code or logic).\n\n"
+    "functions as if you can see their actual code or logic), "
+    "documentation (this IS real, human-written README content -- the "
+    "most authoritative source for what the project is), or "
+    "structural_summary (NOT a README and NOT written by a human -- "
+    "this is automatically derived from file names and code structure "
+    "only, for a repo with no README. NEVER call this 'the README' or "
+    "imply a human wrote it. Describe it as 'based on the code's "
+    "structure' or similar.).\n\n"
     "CRITICAL RULES:\n"
     "1. Structure your answer with one '### FunctionName' section per "
     "retrieved function you discuss. Do not mix facts from different "
@@ -147,6 +179,7 @@ def answer_question(query, conn, repo_key, model='llama3.2:3b', top_k=5):
     misattributions, structure_checked, unrecognized_headers = check_cross_function_attribution(raw_answer, function_hash_map)
     retrieved_names = [qname for _, qname, _ in results]
     overreach = check_retrieval_overreach(raw_answer, retrieved_names)
+    omitted_functions = check_omitted_functions(raw_answer, retrieved_names)
 
     checks = {
         'hallucinated_hashes': sorted(hallucinated_hashes),
@@ -156,6 +189,7 @@ def answer_question(query, conn, repo_key, model='llama3.2:3b', top_k=5):
         'structure_checked': structure_checked,
         'unrecognized_headers': unrecognized_headers,
         'retrieval_overreach': overreach,
+        'omitted_functions': omitted_functions,
         'retrieved_functions': [(qname, round(sim, 3), st) for sim, qname, st in results],
     }
 

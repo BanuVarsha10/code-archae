@@ -528,6 +528,115 @@ wired into the web UI -- still CLI-only (`python ask.py <repo_key>
 this same query; the next real learning will likely come from testing a
 structurally different kind of question, not a fifth round on this one.
 
+## README / project-overview embedding (added post-Phase-C)
+
+### The gap that triggered this work
+Live use surfaced a real hole: "what is this project, how does it work"
+-- arguably the single most natural first question anyone would ask this
+tool -- had nothing good to retrieve against, because only individual
+functions were ever embedded. Similarity scores came back at 0.07-0.11,
+even lower than the deliberately nonsensical payment-processing test
+question (0.26-0.28). Not a retrieval-quality problem like connection
+pooling -- a category of question the architecture had never been built
+to answer at all.
+
+### README chunking
+chunk_readme() splits on markdown "## " headers, treating the intro
+before the first header as its own "Overview" chunk (usually the single
+most information-dense part of a README for "what is this" questions).
+Strips HTML tags and code fences before chunking -- pure noise for
+embedding purposes, and every token spent on markup is a token not
+available for real content, given the already-documented 256-token
+truncation limit. Verified against the real httpx README: correctly
+produced 6 clean chunks (Overview, Features, Installation, Documentation,
+Contribute, Dependencies), each comfortably under the token limit.
+
+### Real, unresolved finding: lexical overlap can beat semantic relevance
+Even with the README correctly chunked and embedded, "what is this
+project" still didn't retrieve the Overview chunk -- it ranked DEAD LAST
+among the 6 chunks (0.029), behind Dependencies and Features, despite
+being the one chunk that actually answers the question. Root cause,
+verified by computing raw cosine similarities directly rather than
+assuming: the query contains the literal word "project," and the
+Documentation chunk opens with "Project documentation is available
+at..." -- a surface lexical match this lightweight embedding model
+(all-MiniLM-L6-v2) appears to weight over Overview's deeper semantic
+content, which never uses the word "project" and refers to "HTTPX" as a
+proper noun instead. This is the SAME category of finding already
+documented in the Phase B section (historical_metadata text sometimes
+out-scoring real code due to keyword density) -- showing up in a new
+place, not a new kind of failure. NOT fixed, and not chased further:
+this is an inherent, honest trade-off of choosing a small, fast,
+free/local embedding model over a larger one. A genuinely better fix
+would require a materially larger embedding model, which is a real
+infrastructure decision with real cost, not a bug to patch.
+
+### Structural summary fallback -- for repos with no README
+User question: can the system derive "what is this project" from code
+alone when there's no README? Honest answer, stated up front rather than
+oversold: code-derived signals can describe STRUCTURE (what files exist,
+which functions are most central) but cannot explain PURPOSE/intent
+unless a human wrote that down somewhere extractable. No amount of
+static analysis invents "why" from pure code shape.
+build_structural_summary() combines: (1) the real file list, (2) the
+most-called functions via the existing call_graph table (self/cls-scoped,
+same known limitation as documented in the Phase A call-graph section),
+(3) real module-level docstrings via ast.get_docstring() where they
+exist. Only triggers when chunk_readme() returns empty (no redundant
+clutter when a real README exists). Verified against real data twice:
+httpx (which does have a README, used only to test the mechanism, not as
+a real fallback case) and banuvarsha10_fin-rag_genai, which genuinely
+has no README (a real one exists, but at finsage/README.md, not repo
+root, which chunk_readme() correctly doesn't check -- a legitimate,
+non-contrived test of the fallback path).
+
+### Real bug found and fixed: the auto-generated summary got called "the README"
+First version stored the fallback under source_type='documentation' --
+the SAME type used for real README content -- with only the qualified
+name itself ("...auto-generated -- no README found") distinguishing it.
+Live result: the model wrote "The README content lists the files..."
+about content that was never a README. Root cause traced precisely: the
+system prompt made a single BLANKET claim for the whole 'documentation'
+type ("this is real README content, not a function"), and the model
+trusted that type-level rule over the specific instance-level label
+sitting right in the qualified name it was given. A prompt-only fix
+would have patched this one instance; the actual fix, consistent with
+how every other ambiguity in this project has been resolved, was
+structural: split into two genuinely distinct source_types --
+'documentation' (real README) and 'structural_summary' (auto-generated,
+explicitly described in the prompt as "NOT a README and NOT written by
+a human"). VERIFIED by direct text search on the regenerated answer
+("README" appears zero times), not by eyeballing.
+
+### Same test run also surfaced a genuine, separate stress case for the check suite -- and it held up
+After the type-split fix, the SAME rerun showed the model abandoning the
+required ### FunctionName section format entirely, inventing narrative
+headers instead (### Project Name, ### Project Finsage, ### Overall --
+none matching any of the 5 real retrieved names). All 5 checks correctly
+fired independently on this single messy generation:
+unrecognized_headers named all 3 invented headers; omitted_functions
+correctly flagged all 5 retrieved items as never literally mentioned
+(verified this is a real finding, not a formatting artifact -- the
+model didn't just reorganize under different headers, it substantively
+narrowed its own scope to discuss only 1 of 5 retrieved items, silently,
+which is exactly the rule-2 violation this check exists to catch);
+red_flags caught a hedge ("suggest that"); retrieval_overreach flagged
+the closing sentence. Consistent with the project's standing decision
+(from the retrieval_overreach pattern-chasing dead end) NOT to chase
+3B-model format compliance with more prompt tightening -- the fix is a
+safety net that degrades honestly when compliance fails, which is
+exactly what happened here, across five independent signals.
+
+### A separate, deliberately-not-fixed finding: missed synthesis is not the same as fabrication
+Earlier in this same investigation, the model had real docstring content
+literally containing "RAG," "reasoning," and "advice" available, and
+produced the vaguer "personal finance management system" instead of
+synthesizing the sharper, more accurate description those words would
+support. Nothing false was stated -- this is a quality ceiling of a
+free, 3B-parameter local model, the same honest trade-off already
+accepted since choosing Ollama over a paid API back in the LLM-layer
+decision. Not a grounding failure; not chased further.
+
 ## Commit attribution hardening
 ~/.claude/settings.json now sets "attribution": {"commit": "", "pr": ""}
 to suppress Claude Code's default commit trailers. This alone was not

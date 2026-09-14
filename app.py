@@ -1,9 +1,10 @@
 import subprocess
 import sqlite3
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Body
 from fastapi.staticfiles import StaticFiles
 import cli as core
 import repo_registry as registry
+import ask
 
 app = FastAPI()
 
@@ -140,6 +141,16 @@ def api_tree(repo_key: str):
         file_node = node.setdefault(filename, {'__type__': 'file', '__functions__': []})
         file_node['__functions__'].append({'name': row['qualified_name'], 'event_count': row['event_count']})
     return tree
+
+
+@app.post("/api/ask")
+def api_ask(repo: str, body: dict = Body(...)):
+    query = body.get("query", "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Empty question")
+    conn = get_conn(repo)
+    answer, checks = ask.answer_question(query, conn, repo)
+    return {"answer": answer, "checks": checks}
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

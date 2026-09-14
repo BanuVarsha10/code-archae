@@ -243,6 +243,7 @@ searchInput.addEventListener('input', () => {
 loadRepos();
 
 const treeViewEl = document.getElementById('tree-view');
+const askView = document.getElementById('ask-view');
 const panelTabs = document.querySelectorAll('.panel-tab');
 let currentView = 'ranked';
 let treeCache = null;
@@ -253,13 +254,19 @@ panelTabs.forEach(tab => {
     tab.classList.add('active');
     currentView = tab.dataset.view;
     searchInput.value = '';
+
+    listEl.classList.add('hidden');
+    treeViewEl.classList.add('hidden');
+    askView.classList.add('hidden');
+
     if (currentView === 'tree') {
-      listEl.classList.add('hidden');
       treeViewEl.classList.remove('hidden');
       panelLabel.textContent = '';
       loadTree();
+    } else if (currentView === 'ask') {
+      askView.classList.remove('hidden');
+      panelLabel.textContent = '';
     } else {
-      treeViewEl.classList.add('hidden');
       listEl.classList.remove('hidden');
       loadList('');
     }
@@ -338,3 +345,94 @@ function renderTreeLevel(node) {
 }
 
 repoSelect.addEventListener('change', () => { treeCache = null; });
+
+const askInput = document.getElementById('ask-input');
+const askSubmitBtn = document.getElementById('ask-submit-btn');
+
+function renderAnswerMarkdown(text) {
+  const escapeHtmlLocal = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const applyInline = (s) => escapeHtmlLocal(s)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  const blocks = text.split(/\n\n+/);
+  const htmlParts = [];
+  blocks.forEach(block => {
+    let trimmed = block.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith('---')) {
+      htmlParts.push('<hr class="ask-divider">');
+      trimmed = trimmed.replace(/^---\s*\n?/, '').trim();
+      if (!trimmed) return;
+    }
+    if (trimmed.startsWith('### ')) {
+      const lines = trimmed.split('\n');
+      const headerText = lines[0].slice(4);
+      const rest = lines.slice(1).join('\n').trim();
+      htmlParts.push(`<h4 class="ask-section-header">${applyInline(headerText)}</h4>`);
+      if (rest) htmlParts.push(`<p>${applyInline(rest).replace(/\n/g, '<br>')}</p>`);
+      return;
+    }
+    htmlParts.push(`<p>${applyInline(trimmed).replace(/\n/g, '<br>')}</p>`);
+  });
+  return htmlParts.join('');
+}
+
+async function submitAskQuestion() {
+  const query = askInput.value.trim();
+  if (!query || !currentRepo) return;
+  askSubmitBtn.disabled = true;
+  askSubmitBtn.textContent = 'Digging...';
+
+  detailEl.innerHTML = `<div class="empty-state"><p>Searching and synthesizing an answer...</p></div>`;
+
+  try {
+    const res = await fetch(`/api/ask?repo=${encodeURIComponent(currentRepo)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query })
+    });
+    const data = await res.json();
+
+    const retrievedHtml = data.checks.retrieved_functions.map(([name, sim, type]) =>
+      `<div class="retrieved-item"><span class="name">${escapeHtml(name)}</span><span class="meta">${sim.toFixed(2)} · ${type}</span></div>`
+    ).join('');
+
+    let groundingParts = [];
+    if (data.checks.hallucinated_hashes.length) groundingParts.push(`<div class="grounding-flag">Unverified hash citation(s): ${data.checks.hallucinated_hashes.join(', ')}</div>`);
+    if (data.checks.hallucinated_issues.length) groundingParts.push(`<div class="grounding-flag">Unverified issue citation(s): ${data.checks.hallucinated_issues.map(n => '#' + n).join(', ')}</div>`);
+    if (Object.keys(data.checks.red_flags).length) groundingParts.push(`<div class="grounding-flag">Hedge language detected: ${Object.entries(data.checks.red_flags).map(([p, c]) => `"${p}" ×${c}`).join(', ')}</div>`);
+    if (data.checks.structure_checked === false) groundingParts.push(`<div class="grounding-flag">Could not verify cross-function attribution (model did not use the expected section format)</div>`);
+    if (data.checks.misattributions && data.checks.misattributions.length) groundingParts.push(`<div class="grounding-flag">${data.checks.misattributions.length} cross-function misattribution(s) detected</div>`);
+    if (data.checks.unrecognized_headers && data.checks.unrecognized_headers.length) groundingParts.push(`<div class="grounding-flag">Unrecognized section header(s): ${data.checks.unrecognized_headers.join(', ')}</div>`);
+    if (data.checks.retrieval_overreach && data.checks.retrieval_overreach.length) groundingParts.push(`<div class="grounding-flag">Possible overreach detected (secondary signal): ${data.checks.retrieval_overreach.length} instance(s)</div>`);
+
+    const groundingHtml = groundingParts.length
+      ? `<div class="grounding-notes">${groundingParts.join('')}</div>`
+      : `<div class="grounding-notes"><div class="grounding-clean">Passed all grounding checks.</div></div>`;
+
+    detailEl.innerHTML = `
+      <div class="detail-header">
+        <h1 class="detail-title">Ask: "${escapeHtml(query)}"</h1>
+      </div>
+      <div class="retrieved-list">
+        <div class="retrieved-list-title">Retrieved functions</div>
+        ${retrievedHtml}
+      </div>
+      <div class="explanation-card">
+        <div class="ask-answer">${renderAnswerMarkdown(data.answer)}</div>
+        ${groundingHtml}
+      </div>
+    `;
+  } catch (err) {
+    detailEl.innerHTML = `<p class="digging-note">Something went wrong reaching the dig site. Is Ollama running?</p>`;
+  } finally {
+    askSubmitBtn.disabled = false;
+    askSubmitBtn.textContent = 'Ask';
+  }
+}
+
+askSubmitBtn.addEventListener('click', submitAskQuestion);
+askInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) submitAskQuestion();
+});
