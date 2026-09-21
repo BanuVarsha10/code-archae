@@ -1,49 +1,104 @@
-## Running locally (and adding your own repos)
+# 🧭 Code Archaeologist — Git History Reconstruction & Grounded RAG
 
-The public demo runs against a fixed set of pre-indexed repos and can't
-index new ones live (see "Why is live indexing disabled?" below). To
-index your own repo, run this project on your own machine instead --
-full control, no resource limits, no restrictions.
+> **Understand not just what the code does, but why the repository history records that it changed.**
 
-### Setup
+[![Python](https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![PyDriller](https://img.shields.io/badge/PyDriller-Git%20Mining-6E40C9)](https://github.com/ishepard/pydriller)
+[![RAG](https://img.shields.io/badge/RAG-Grounded%20Retrieval-7C3AED)](#architecture)
+[![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 
-1. Clone this repo and `cd` into it.
-2. Install dependencies: `pip install -r requirements.txt`
-3. Create a `.env` file with:
+Code Archaeologist is a developer tool for reconstructing how Python code evolves across Git history. It tracks functions across commits—even when functions are renamed or refactored—connects code changes to GitHub issues/PRs, and uses retrieved historical context to answer developer questions.
 
+## ✨ What it does
+
+- 🕰️ Mines Git history with **PyDriller**
+- 🌳 Extracts Python functions with the **AST**
+- 🔗 Tracks function identity using **exact-name + similarity matching**
+- 🧬 Builds a function lifeline across historical versions
+- 🔎 Grounds code history with linked GitHub issues/PRs
+- 🧠 Builds semantic embeddings for retrieval
+- 💬 Generates explanations using **Ollama / Llama 3.2 3B**
+- 🛡️ Verifies cited commit hashes and checks for unsupported event descriptions
+
+## 🏗️ Architecture
+
+![Architecture](architecture.png)
+
+> Mermaid source: [`architecture.mmd`](architecture.mmd)
+
+## 🔬 Function identity matching
+
+A simple name lookup breaks when a function is renamed. Code Archaeologist first handles unambiguous exact-name matches and then compares remaining function bodies using similarity scoring and assignment to identify likely rename relationships.
+
+The current pipeline stores commit metadata and function events in SQLite and then enriches the history with GitHub issue/PR information.
+
+## 🤖 Grounded explanations
+
+The explanation layer is deliberately constrained by the structured history it receives. It is instructed not to invent motivations when the available PR/commit data does not establish them.
+
+Verification includes:
+
+- commit-hash validation against known history
+- malformed-but-real citation handling
+- red-flag phrase scanning
+- event-type consistency checks
+
+## 🧰 Tech stack
+
+| Layer | Technologies |
+|---|---|
+| Git mining | PyDriller, Git |
+| Parsing | Python AST |
+| Matching | `difflib`, SciPy assignment |
+| Storage | SQLite |
+| Retrieval | Sentence Transformers |
+| LLM | Ollama / Llama 3.2 3B |
+| API | FastAPI + Uvicorn |
+| Frontend / assets | HTML, CSS, JavaScript |
+| Deployment | Docker |
+
+## 🚀 Run locally
+
+```bash
+git clone https://github.com/BanuVarsha10/code-archae.git
+cd code-archae
+
+pip install -r requirements.txt
+
+# Create .env
 GITHUB_TOKEN=your_github_token_here
 
-   (A fine-grained token with public-repo read access is enough --
-   this is used to fetch linked issue/PR titles.)
-4. Install [Ollama](https://ollama.com) and pull the model this project
-   uses by default:
-
 ollama pull llama3.2:3b
-
-5. Start the server:
-
 python -m uvicorn app:app --reload
+```
 
-   (On Windows, if you hit an OpenMP-related crash on startup, prefix
-   the command with `KMP_DUPLICATE_LIB_OK=TRUE` -- a known conflict
-   between numpy's and torch's bundled OpenMP runtimes, harmless to
-   work around this way.)
-6. Open `http://localhost:8000` in your browser.
+Open `http://localhost:8000`.
 
-### Adding a repo
+To index a repository locally, use the **Add repo** flow and provide a public GitHub URL.
 
-Click **"+ Add repo"** in the top bar and paste any public GitHub URL.
-This clones it, mines its git history, matches function identity across
-renames, links commits to real GitHub issues/PRs, and builds semantic
-embeddings -- all in the background. Expect this to take real minutes,
-not seconds, for a repo with substantial history (the original httpx
-index, 450 commits, took about 9 minutes on a laptop).
+### Public demo note
 
-### Why is live indexing disabled on the public deployment?
+The hosted deployment uses pre-indexed repositories. Live indexing is enabled locally because repository indexing can require substantial CPU, memory and persistent storage.
 
-The public demo runs on a free-tier container with 0.1 CPU and 512MB
-RAM and no persistent disk -- a real indexing job would be extremely
-slow at best, and anything it produced would vanish on the next
-restart. Rather than offer a broken or misleading version of the
-feature publicly, it's fully enabled locally and disabled on the
-hosted demo, with an honest message explaining why.
+## 📁 Key files
+
+```text
+pipeline.py            → repository cloning + commit/function mining
+match_functions.py     → function matching utilities
+fetch_issues*.py       → GitHub issue/PR grounding
+build_embeddings.py    → semantic representation
+explain.py             → grounded explanation + verification
+app.py                 → application/API entry point
+repo_registry.py       → repository/index status
+```
+
+## 🎯 Why it matters
+
+Legacy systems are difficult to understand because the most useful context is often buried in years of commits, refactors and issue discussions.
+
+Code Archaeologist turns that history into searchable, structured context for developers.
+
+---
+
+**Repository:** https://github.com/BanuVarsha10/code-archae

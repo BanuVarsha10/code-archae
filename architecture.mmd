@@ -1,0 +1,23 @@
+flowchart LR
+    A["GitHub Repository"] --> B["PyDriller
+Commit History"]
+    B --> C["Python AST
+Function Extraction"]
+    C --> D["Function Identity Matching"]
+    D --> D1["Exact Name Match"]
+    D --> D2["Similarity Match
+Rename / Refactor"]
+    D1 --> E["Function Lifeline"]
+    D2 --> E
+    B --> F["GitHub Issues / PRs"]
+    E --> G["Context Assembly"]
+    F --> G
+    G --> H["Semantic Embeddings
+Sentence Transformers"]
+    H --> I["Grounded Retrieval"]
+    I --> J["Ollama / Llama 3.2 3B"]
+    J --> K["Explanation"]
+    K --> L["Verification"]
+    L --> L1["Commit Hash Check"]
+    L --> L2["Red-Flag Phrase Scan"]
+    L --> L3["Event-Type Consistency"]
